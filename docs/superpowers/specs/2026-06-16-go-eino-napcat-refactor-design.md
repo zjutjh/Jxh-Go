@@ -198,37 +198,76 @@ github.com/zjutjh/napcat-sdk
 
 ### 7.1 WPS 知识表
 
-前两列兼容旧回复表：
+WPS 继续以现有两列为主。导入器负责把两列回复表解析成知识库记录，并自动补充 RAG 所需的 `content`、分类、菜单路径和检索别名。
+
+基础列：
 
 | 列 | 字段 | 说明 |
 | --- | --- | --- |
 | A | `keyword` | 关键词。旧表第一列映射到这里 |
 | B | `answer` | 标准回答。旧表第二列映射到这里 |
 
-建议新增列：
+第三列规则：
+
+- C 列不导入数据库。
+- C 列不参与关键词回复。
+- C 列不参与 `/ai` 检索、embedding 或 prompt。
+- 如果 `dev` sheet 中存在 C 列，只视为人工维护备注或修订意见。
+
+可选新增列：
 
 | 列 | 字段 | 说明 |
 | --- | --- | --- |
-| C | `aliases` | 同义问法，多个用 `;` 分隔 |
-| D | `category` | 分类，如 校园卡、宿舍、网络、教务 |
-| E | `tags` | 标签，多个用 `;` 分隔 |
-| F | `enabled` | 是否启用，空值按启用处理 |
-| G | `exact_reply` | 是否参与关键词精确回复，空值按启用处理 |
-| H | `ai_enabled` | 是否参与 `/ai` 检索，空值按启用处理 |
-| I | `content` | 扩展知识正文，空值时使用 `answer` |
-| J | `updated_at` | 人工维护时间，可空 |
-| K | `source_id` | 可选稳定 ID；为空时用规范化后的 `keyword` |
+| D | `aliases` | 可选同义问法，多个用 `;` 分隔 |
+| E | `category` | 可选分类，如 交通、选课、宿舍、报到 |
+| F | `usage` | 可选用途：`both` / `exact` / `ai`；空值由导入器判断 |
+| G | `status` | 可选状态：`enabled` / `disabled` / `draft`；空值按 `enabled` |
+| H | `source_id` | 可选稳定 ID；为空时用规范化后的 `keyword` |
 
 兼容规则：
 
 - 旧两列表仍可导入。
-- `content` 为空时，AI 使用 `answer` 作为知识正文。
+- `answer` 是精确关键词命中后直接发给群的内容。
+- `content` 不要求人工维护，由导入器根据 `keyword`、菜单路径、`aliases`、`category` 和 `answer` 自动生成。
 - `aliases` 参与 `/ai` 检索，也可参与关键词匹配。
-- `exact_reply=false` 的条目不做普通关键词回复，但可给 `/ai` 使用。
-- `ai_enabled=false` 的条目可做关键词回复，但不进入 `/ai`。
+- `status=disabled` 或 `draft` 的条目不参与关键词回复和 `/ai`。
+- `usage=exact` 的条目只做关键词回复，不进入 `/ai`。
+- `usage=ai` 的条目只进入 `/ai`，不做关键词精确回复。
+- `usage=both` 的条目同时参与关键词回复和 `/ai`。
 - 修改 `keyword` 时如果想保留同一条记录，应填写稳定的 `source_id`。
 
-### 7.2 MySQL 表
+### 7.2 导入器自动增强
+
+导入器必须理解现有 `data.xlsx` 这类结构，不能只把第二列原样丢进向量库。
+
+行类型：
+
+| 类型 | 判断 | 处理 |
+| --- | --- | --- |
+| `menu_node` | `keyword` 是 `%数字`，且 `answer` 中包含 `%子编号 标题` | 保留精确回复；作为菜单树节点和上下文来源 |
+| `knowledge` | 自然关键词，或没有子节点的 `%数字` 叶子节点 | 进入关键词回复和 `/ai` |
+| `chitchat` | 短关键词 + 短趣味回复，如 晚安、饿了、美女 | 默认只做关键词回复，不进 `/ai` |
+| `maintenance_note` | `dev` sheet 第三列 | 忽略，不入库 |
+
+菜单树解析：
+
+- 从 `answer` 中提取 `%数字 标题`，建立父子关系。
+- 对叶子节点生成标题路径，例如 `朝晖校区交通 / 火车站 / 杭州东站`。
+- 叶子节点的 `content` 使用 `标题路径 + aliases + answer`。
+- 菜单中间节点默认可做关键词回复，但不优先进入 `/ai`；如果内容本身有事实说明，可按 `knowledge` 处理。
+
+自动生成字段：
+
+| 字段 | 生成规则 |
+| --- | --- |
+| `source_key` | 优先 `source_id`，否则规范化 `keyword` |
+| `content` | `标题路径 + keyword + aliases + answer`；自然关键词没有路径时用 `keyword + aliases + answer` |
+| `category` | 优先 WPS `category`；否则从顶层菜单或关键词规则推断 |
+| `aliases` | 合并 WPS aliases、菜单标题、标题路径中的末级标题、常见同义问法 |
+| `exact_reply` | `status=enabled` 且 `usage` 为 `both` 或 `exact` |
+| `ai_enabled` | `status=enabled` 且 `usage` 为 `both` 或 `ai`，但 `chitchat` 默认 false |
+
+### 7.3 MySQL 表
 
 `knowledge_entries` 是关键词回复和 `/ai` 共用的唯一知识源。
 
@@ -237,6 +276,8 @@ knowledge_entries(
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   source_key VARCHAR(255) NOT NULL UNIQUE,
   keyword VARCHAR(255) NOT NULL,
+  entry_type VARCHAR(32) NOT NULL,
+  path VARCHAR(512) NULL,
   aliases_json JSON NULL,
   category VARCHAR(64) NULL,
   tags_json JSON NULL,
@@ -253,9 +294,14 @@ knowledge_entries(
   source_updated_at DATETIME NULL,
   created_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL,
-  FULLTEXT KEY ft_knowledge_keyword_content (keyword, answer, content)
+  FULLTEXT KEY ft_knowledge_keyword_content (keyword, path, answer, content)
 )
 ```
+
+解析字段：
+
+- `entry_type`：`menu_node`、`knowledge` 或 `chitchat`。
+- `path`：菜单树标题路径；自然关键词可为空。
 
 向量字段只描述派生索引状态：
 
@@ -316,7 +362,10 @@ processed_events(
 ```text
 /reload
   -> 下载 WPS xlsx
-  -> 解析知识表
+  -> 解析 release sheet 基础两列
+  -> 忽略 dev sheet 第三列维护备注
+  -> 识别菜单树、知识条目和闲聊条目
+  -> 自动生成 content、aliases、category、usage
   -> 校验 keyword / answer
   -> 计算 content_hash
   -> 事务 upsert knowledge_entries
@@ -332,7 +381,11 @@ processed_events(
 - `source_key` 优先使用 WPS `source_id`。
 - `source_id` 为空时，`source_key` 使用规范化后的 `keyword`。
 - 空 `keyword` 或空 `answer` 跳过。
-- 同一 `source_key` 重复时，后出现的行跳过并记录日志。
+- 同一 `source_key` 且 `answer` 相同的重复行只导入一次。
+- 同一 `source_key` 但 `answer` 不同的重复行记录冲突；默认保留第一条，冲突行不进入 `/ai`。
+- 短趣味回复默认标记为 `usage=exact`，避免污染 RAG。
+- `%数字` 菜单叶子节点默认可进入 `/ai`，但中间菜单节点只有在包含事实说明时进入 `/ai`。
+- 第三列内容不入库、不参与检索，只在导入日志中统计有多少维护备注被忽略。
 - WPS 下载失败不清空已有知识。
 - 成功导入后才替换内存缓存，避免半更新状态。
 - 每次成功导入记录 `last_import_run_id`。
@@ -427,6 +480,10 @@ exact > vector_score > fulltext_score > updated_at
 
 MySQL 中文全文检索效果取决于部署环境和分词配置。因此精确匹配、aliases 和 `LIKE` fallback 必须可用，不能只依赖 FULLTEXT。
 
+RAG 检索使用导入器生成的 `content`。对于菜单树叶子节点，`content` 必须包含标题路径，例如 `朝晖校区交通 / 火车站 / 杭州东站`，否则用户用自然语言提问时很难召回 `%0011` 这类编号知识。
+
+`answer` 仍保留原始回复文本。关键词命中直接发送 `answer`；`/ai` 检索和 embedding 使用 `content`，并在 prompt metadata 中携带 `answer` 作为短答参考。
+
 ### 10.3 向量索引
 
 `internal/vector` 提供窄接口：
@@ -470,6 +527,7 @@ Document.MetaData = {
   "category": category,
   "tags": tags,
   "answer": answer,
+  "path": path,
   "sources": ["exact" | "vector" | "fulltext" | "like"]
 }
 ```
@@ -646,6 +704,9 @@ debug:
 ### Phase 3：知识同步和关键词回复
 
 - 实现 WPS 下载和 Excel 解析。
+- 实现 release 两列解析，忽略 dev 第三列维护备注。
+- 实现 `%数字` 菜单树解析、标题路径生成和闲聊条目识别。
+- 实现 `content`、`aliases`、`category`、`usage` 自动生成。
 - 实现 `/reload` 同步知识库。
 - 实现内存关键词索引。
 - 实现关键词和 aliases 精确回复。
@@ -682,7 +743,11 @@ debug:
 - `internal/napcat` 事件适配。
 - `internal/napcat` API 调用封装。
 - WPS 两列表兼容导入。
-- 新 WPS 知识表导入。
+- WPS 可选列覆盖规则导入。
+- dev sheet 第三列维护备注不入库。
+- `%数字` 菜单树解析和标题路径生成。
+- 短趣味回复自动标记为 `usage=exact`。
+- 重复 key 同 answer 去重、不同 answer 记录冲突。
 - `knowledge_entries` upsert 和事务回滚。
 - 关键词和 aliases 精确匹配。
 - MySQL 文本 Retriever 排序和过滤。
@@ -706,7 +771,9 @@ CI 使用 fake NapCat adapter、fake quote server、fake ChatModel、fake vector
 
 - NapCat 能通过反向 WebSocket 连接 Go 服务。
 - WPS 两列表能导入为知识库。
-- 新 WPS 知识表能导入为知识库。
+- WPS 第三列维护备注不会进入数据库、向量索引或 `/ai` prompt。
+- `%数字` 菜单树能解析为带标题路径的知识条目。
+- 短趣味回复不会污染 `/ai` RAG。
 - 关键词回复读 `knowledge_entries`。
 - `/reload` 能同步知识库并刷新关键词缓存。
 - `/ai <问题>` 能基于知识库回答，向量索引启用时优先参与召回。
