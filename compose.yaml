@@ -22,6 +22,7 @@ services:
     environment:
       JXH_MYSQL_PASSWORD: ${JXH_MYSQL_PASSWORD:-jxh_password}
       JXH_ONEBOT_TOKEN: ${JXH_ONEBOT_TOKEN:-}
+      JXH_ONEBOT_WS_URL: ${JXH_ONEBOT_WS_URL:-ws://host.docker.internal:3001}
       JXH_WPS_SID: ${JXH_WPS_SID:-}
       JXH_AI_BASE_URL: ${JXH_AI_BASE_URL:-}
       JXH_AI_API_KEY: ${JXH_AI_API_KEY:-}

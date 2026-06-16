@@ -30,14 +30,16 @@ type AppConfig struct {
 }
 
 type ServerConfig struct {
-	Addr       string `yaml:"addr"`
-	OneBotPath string `yaml:"onebot_path"`
+	Addr string `yaml:"addr"`
 }
 
 type OneBotConfig struct {
-	AccessToken   string        `yaml:"access_token"`
-	APITimeoutSec int           `yaml:"api_timeout_sec"`
-	APITimeout    time.Duration `yaml:"-"`
+	WSURL                string        `yaml:"ws_url"`
+	AccessToken          string        `yaml:"access_token"`
+	APITimeoutSec        int           `yaml:"api_timeout_sec"`
+	ReconnectIntervalSec int           `yaml:"reconnect_interval_sec"`
+	APITimeout           time.Duration `yaml:"-"`
+	ReconnectInterval    time.Duration `yaml:"-"`
 }
 
 type WPSConfig struct {
@@ -131,10 +133,13 @@ func Default() Config {
 	return Config{
 		App: AppConfig{LogLevel: "info", Timezone: "Asia/Shanghai"},
 		Server: ServerConfig{
-			Addr:       ":8080",
-			OneBotPath: "/onebot/v11/ws",
+			Addr: ":8080",
 		},
-		OneBot: OneBotConfig{APITimeoutSec: 30},
+		OneBot: OneBotConfig{
+			WSURL:                "ws://127.0.0.1:3001",
+			APITimeoutSec:        30,
+			ReconnectIntervalSec: 5,
+		},
 		WPS: WPSConfig{
 			Sheet:       "release",
 			CacheFile:   "./data/cache/knowledge.xlsx",
@@ -184,6 +189,7 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	override("JXH_ONEBOT_TOKEN", func(v string) { cfg.OneBot.AccessToken = v })
+	override("JXH_ONEBOT_WS_URL", func(v string) { cfg.OneBot.WSURL = v })
 	override("JXH_WPS_SID", func(v string) { cfg.WPS.SID = v })
 	override("JXH_MYSQL_PASSWORD", func(v string) { cfg.Database.Password = v })
 	override("JXH_MYSQL_DSN", func(v string) { cfg.Database.DSN = v })
@@ -197,16 +203,17 @@ func normalize(cfg *Config) {
 	if cfg.Server.Addr == "" {
 		cfg.Server.Addr = ":8080"
 	}
-	if cfg.Server.OneBotPath == "" {
-		cfg.Server.OneBotPath = "/onebot/v11/ws"
-	}
 	if cfg.WPS.Sheet == "" {
 		cfg.WPS.Sheet = "release"
 	}
 	if cfg.OneBot.APITimeoutSec <= 0 {
 		cfg.OneBot.APITimeoutSec = 30
 	}
+	if cfg.OneBot.ReconnectIntervalSec <= 0 {
+		cfg.OneBot.ReconnectIntervalSec = 5
+	}
 	cfg.OneBot.APITimeout = time.Duration(cfg.OneBot.APITimeoutSec) * time.Second
+	cfg.OneBot.ReconnectInterval = time.Duration(cfg.OneBot.ReconnectIntervalSec) * time.Second
 	if cfg.AI.TopK <= 0 {
 		cfg.AI.TopK = 5
 	}

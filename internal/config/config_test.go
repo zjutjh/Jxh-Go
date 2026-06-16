@@ -15,6 +15,7 @@ func TestLoadAppliesDefaultsAndEnvOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("JXH_ONEBOT_TOKEN", "token-from-env")
+	t.Setenv("JXH_ONEBOT_WS_URL", "ws://napcat:3001")
 	t.Setenv("JXH_MYSQL_DSN", "user:pass@tcp(localhost:3306)/jxh?charset=utf8mb4&parseTime=True&loc=Local")
 	t.Setenv("JXH_AI_API_KEY", "ai-key")
 
@@ -24,6 +25,12 @@ func TestLoadAppliesDefaultsAndEnvOverrides(t *testing.T) {
 	}
 	if cfg.OneBot.AccessToken != "token-from-env" {
 		t.Fatalf("access token = %q", cfg.OneBot.AccessToken)
+	}
+	if cfg.OneBot.WSURL != "ws://napcat:3001" {
+		t.Fatalf("onebot ws url = %q", cfg.OneBot.WSURL)
+	}
+	if cfg.OneBot.ReconnectIntervalSec != 5 {
+		t.Fatalf("reconnect interval sec = %d", cfg.OneBot.ReconnectIntervalSec)
 	}
 	if cfg.Database.DSN != "user:pass@tcp(localhost:3306)/jxh?charset=utf8mb4&parseTime=True&loc=Local" {
 		t.Fatalf("dsn = %q", cfg.Database.DSN)

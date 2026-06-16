@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -25,25 +26,84 @@ type Dedupe interface {
 
 type Server struct {
 	Addr           string
+	WSURL          string
 	Token          string
 	RequestTimeout time.Duration
+	ReconnectDelay time.Duration
 	Handler        Handler
 	Dedupe         Dedupe
 }
 
 func (s Server) Serve(ctx context.Context) error {
+	if s.WSURL != "" {
+		return s.serveForwardWebSocket(ctx)
+	}
 	return napcatsdk.ServeReverseWebSocket(ctx, s.Addr, func(client *napcatsdk.Client) {
-		sender := SDKSender{client: client}
-		if setter, ok := s.Handler.(interface{ SetSender(bot.Sender) }); ok {
-			setter.SetSender(sender)
+		s.consume(ctx, client)
+	}, napcatsdk.WithToken(s.Token), napcatsdk.WithRequestTimeout(s.RequestTimeout))
+}
+
+func (s Server) serveForwardWebSocket(ctx context.Context) error {
+	delay := s.ReconnectDelay
+	if delay <= 0 {
+		delay = 5 * time.Second
+	}
+	for {
+		client, err := napcatsdk.DialWebSocket(ctx, s.WSURL, napcatsdk.WithToken(s.Token), napcatsdk.WithRequestTimeout(s.RequestTimeout))
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("connect napcat websocket failed: %v", err)
+			if !sleepContext(ctx, delay) {
+				return nil
+			}
+			continue
 		}
-		for ev := range client.Events() {
+		log.Printf("connected to napcat websocket: %s", s.WSURL)
+		s.consume(ctx, client)
+		_ = client.Close()
+		if ctx.Err() != nil {
+			return nil
+		}
+		log.Printf("napcat websocket disconnected, reconnecting in %s", delay)
+		if !sleepContext(ctx, delay) {
+			return nil
+		}
+	}
+}
+
+func (s Server) consume(ctx context.Context, client *napcatsdk.Client) {
+	sender := SDKSender{client: client}
+	if setter, ok := s.Handler.(interface{ SetSender(bot.Sender) }); ok {
+		setter.SetSender(sender)
+	}
+	events := client.Events()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
 			if s.Dedupe != nil && s.Dedupe.SeenOrMark(eventKey(ev)) {
 				continue
 			}
 			_ = s.handleEvent(ctx, ev)
 		}
-	}, napcatsdk.WithToken(s.Token), napcatsdk.WithRequestTimeout(s.RequestTimeout))
+	}
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s Server) handleEvent(ctx context.Context, ev event.Event) error {

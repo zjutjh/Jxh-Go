@@ -5,11 +5,12 @@ app:
 
 server:
   addr: ":8080"
-  onebot_path: "/onebot/v11/ws"
 
 onebot:
+  ws_url: "ws://127.0.0.1:3001"
   access_token: ""
   api_timeout_sec: 30
+  reconnect_interval_sec: 5
 
 wps:
   share_url: ""

@@ -94,14 +94,20 @@ func main() {
 
 	server := napcat.Server{
 		Addr:           cfg.Server.Addr,
+		WSURL:          cfg.OneBot.WSURL,
 		Token:          cfg.OneBot.AccessToken,
 		RequestTimeout: cfg.OneBot.APITimeout,
+		ReconnectDelay: cfg.OneBot.ReconnectInterval,
 		Handler:        pipeline,
 		Dedupe:         eventDedupe,
 	}
-	log.Printf("starting bot on %s", cfg.Server.Addr)
+	if cfg.OneBot.WSURL != "" {
+		log.Printf("connecting napcat websocket %s", cfg.OneBot.WSURL)
+	} else {
+		log.Printf("starting reverse websocket server on %s", cfg.Server.Addr)
+	}
 	if err := server.Serve(ctx); err != nil {
-		log.Fatalf("serve napcat reverse websocket: %v", err)
+		log.Fatalf("serve napcat websocket: %v", err)
 	}
 }
 

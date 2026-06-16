@@ -4,7 +4,7 @@
 
 ## 当前能力
 
-- NapCat OneBot v11 反向 WebSocket 接入。
+- NapCat OneBot v11 WebSocket 接入，默认采用 MumuBot 类似的正向 WebSocket：bot 主动连接 NapCat。
 - WPS `release` sheet 两列回复表导入。
 - 第三列维护备注不入库、不参与 RAG。
 - `%编号` 菜单树解析，生成 `path` 和 RAG `content`。
@@ -22,10 +22,16 @@ go test ./...
 go run ./cmd/bot -config config.yaml
 ```
 
-NapCat 反向 WebSocket 地址：
+NapCat 需要独立运行。参考 MumuBot 的部署方式，本项目默认不把 NapCat 放进 Docker Compose，而是在配置里填写 NapCat 的 OneBot WebSocket 地址：
 
 ```text
-ws://bot:8080/onebot/v11/ws
+onebot.ws_url: ws://127.0.0.1:3001
+```
+
+在 NapCat 中开启 OneBot 11 WebSocket 服务，监听地址和端口与 `onebot.ws_url` 保持一致。如果 bot 跑在 Docker 里、NapCat 跑在宿主机，compose 默认使用：
+
+```text
+JXH_ONEBOT_WS_URL=ws://host.docker.internal:3001
 ```
 
 ## Docker Compose
@@ -35,7 +41,7 @@ cp config.example.yaml config.yaml
 docker compose up --build
 ```
 
-默认只启动 `mysql` 和 `bot`。引用图服务可按实际镜像调整后启用 `quote` profile。
+默认只启动 `mysql` 和 `bot`。NapCat 按 MumuBot 风格独立运行，引用图服务可按实际镜像调整后启用 `quote` profile。
 
 ## WPS 表规则
 
