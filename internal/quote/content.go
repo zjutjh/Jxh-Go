@@ -1,4 +1,4 @@
-package bot
+package quote
 
 import (
 	"encoding/base64"
@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/zjutjh/jxh-go/internal/quote"
 )
 
 const qqFaceDirEnv = "JXH_QQ_FACE_DIR"
@@ -22,9 +20,9 @@ type onebotSegment struct {
 	Data map[string]any `json:"data"`
 }
 
-func quoteMessageContent(raw string, structured ...any) any {
+func ContentFromMessage(raw string, structured ...any) any {
 	if len(structured) > 0 {
-		if content, ok := quoteStructuredMessageContent(structured[0]); ok {
+		if content, ok := structuredMessageContent(structured[0]); ok {
 			return content
 		}
 	}
@@ -38,12 +36,39 @@ func quoteMessageContent(raw string, structured ...any) any {
 	return segments
 }
 
-func quoteStructuredMessageContent(raw any) (any, bool) {
+func IsEmptyContent(content any) bool {
+	switch v := content.(type) {
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []MessageSegment:
+		return len(v) == 0
+	default:
+		return v == nil
+	}
+}
+
+func Nickname(nickname string) string {
+	nickname = strings.TrimSpace(nickname)
+	if nickname == "" {
+		return "匿名"
+	}
+	return nickname
+}
+
+func ImageFile(image string) string {
+	image = strings.TrimSpace(image)
+	if strings.HasPrefix(image, "base64://") || strings.HasPrefix(image, "http://") || strings.HasPrefix(image, "https://") || strings.HasPrefix(image, "file://") {
+		return image
+	}
+	return "base64://" + image
+}
+
+func structuredMessageContent(raw any) (any, bool) {
 	onebotSegments, ok := decodeOneBotSegments(raw)
 	if !ok {
 		return nil, false
 	}
-	var segments []quote.MessageSegment
+	var segments []MessageSegment
 	for _, segment := range onebotSegments {
 		switch segment.Type {
 		case "reply":
@@ -91,8 +116,8 @@ func decodeOneBotSegments(raw any) ([]onebotSegment, bool) {
 	return segments, true
 }
 
-func parseCQMessage(raw string) []quote.MessageSegment {
-	var segments []quote.MessageSegment
+func parseCQMessage(raw string) []MessageSegment {
+	var segments []MessageSegment
 	for len(raw) > 0 {
 		start := strings.Index(raw, "[CQ:")
 		if start < 0 {
@@ -113,26 +138,15 @@ func parseCQMessage(raw string) []quote.MessageSegment {
 	return mergeAdjacentTextSegments(segments)
 }
 
-func isEmptyQuoteContent(content any) bool {
-	switch v := content.(type) {
-	case string:
-		return strings.TrimSpace(v) == ""
-	case []quote.MessageSegment:
-		return len(v) == 0
-	default:
-		return v == nil
-	}
-}
-
-func appendTextSegment(segments *[]quote.MessageSegment, text string) {
+func appendTextSegment(segments *[]MessageSegment, text string) {
 	text = html.UnescapeString(text)
 	if text == "" {
 		return
 	}
-	*segments = append(*segments, quote.MessageSegment{Type: "text", Text: text})
+	*segments = append(*segments, MessageSegment{Type: "text", Text: text})
 }
 
-func appendCQSegment(segments *[]quote.MessageSegment, body string) {
+func appendCQSegment(segments *[]MessageSegment, body string) {
 	parts := strings.Split(body, ",")
 	if len(parts) == 0 {
 		return
@@ -165,7 +179,7 @@ func appendCQSegment(segments *[]quote.MessageSegment, body string) {
 	}
 }
 
-func appendURLImageSegment(segments *[]quote.MessageSegment, url, kind, fallback string) {
+func appendURLImageSegment(segments *[]MessageSegment, url, kind, fallback string) {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		appendTextSegment(segments, fallback)
@@ -174,7 +188,7 @@ func appendURLImageSegment(segments *[]quote.MessageSegment, url, kind, fallback
 	appendImageSegment(segments, url, kind)
 }
 
-func appendDataImageSegment(segments *[]quote.MessageSegment, data map[string]any, kind, fallback string) {
+func appendDataImageSegment(segments *[]MessageSegment, data map[string]any, kind, fallback string) {
 	source := firstUsableImageSource(segmentDataString(data, "url"), segmentDataString(data, "file"))
 	if source == "" {
 		appendTextSegment(segments, fallback)
@@ -183,12 +197,12 @@ func appendDataImageSegment(segments *[]quote.MessageSegment, data map[string]an
 	appendImageSegment(segments, source, kind)
 }
 
-func appendImageSegment(segments *[]quote.MessageSegment, url, kind string) {
-	url = normalizeQuoteImageSource(url)
-	*segments = append(*segments, quote.MessageSegment{Type: "image", Kind: kind, URL: url})
+func appendImageSegment(segments *[]MessageSegment, url, kind string) {
+	url = normalizeImageSource(url)
+	*segments = append(*segments, MessageSegment{Type: "image", Kind: kind, URL: url})
 }
 
-func normalizeQuoteImageSource(source string) string {
+func normalizeImageSource(source string) string {
 	source = strings.TrimSpace(source)
 	if strings.HasPrefix(source, "base64://") {
 		return "data:image/png;base64," + strings.TrimPrefix(source, "base64://")
@@ -219,7 +233,7 @@ func imageFileDataURI(path string) (string, bool) {
 	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data), true
 }
 
-func appendQQFaceSegment(segments *[]quote.MessageSegment, params map[string]string) {
+func appendQQFaceSegment(segments *[]MessageSegment, params map[string]string) {
 	if url := strings.TrimSpace(params["url"]); url != "" {
 		appendImageSegment(segments, url, "emoji")
 		return
@@ -232,7 +246,7 @@ func appendQQFaceSegment(segments *[]quote.MessageSegment, params map[string]str
 	appendTextSegment(segments, "[表情]")
 }
 
-func appendCQEmojiSegment(segments *[]quote.MessageSegment, params map[string]string) {
+func appendCQEmojiSegment(segments *[]MessageSegment, params map[string]string) {
 	if url := strings.TrimSpace(params["url"]); url != "" {
 		appendImageSegment(segments, url, "emoji")
 		return
@@ -249,7 +263,7 @@ func appendCQEmojiSegment(segments *[]quote.MessageSegment, params map[string]st
 	appendTextSegment(segments, "[表情]")
 }
 
-func appendStructuredEmojiSegment(segments *[]quote.MessageSegment, data map[string]any) {
+func appendStructuredEmojiSegment(segments *[]MessageSegment, data map[string]any) {
 	if source := firstUsableImageSource(segmentDataString(data, "url"), segmentDataString(data, "file")); source != "" {
 		appendImageSegment(segments, source, "emoji")
 		return
@@ -257,7 +271,7 @@ func appendStructuredEmojiSegment(segments *[]quote.MessageSegment, data map[str
 	appendCQEmojiSegment(segments, stringMapFromAnyMap(data))
 }
 
-func appendAtSegment(segments *[]quote.MessageSegment, data map[string]any) {
+func appendAtSegment(segments *[]MessageSegment, data map[string]any) {
 	name := firstNonEmpty(segmentDataString(data, "name"), segmentDataString(data, "card"), segmentDataString(data, "nickname"))
 	if name == "" {
 		name = segmentDataString(data, "qq")
@@ -401,11 +415,11 @@ func defaultQQFaceAssetDirs() []string {
 	return matches
 }
 
-func mergeAdjacentTextSegments(segments []quote.MessageSegment) []quote.MessageSegment {
+func mergeAdjacentTextSegments(segments []MessageSegment) []MessageSegment {
 	if len(segments) < 2 {
 		return segments
 	}
-	merged := make([]quote.MessageSegment, 0, len(segments))
+	merged := make([]MessageSegment, 0, len(segments))
 	for _, segment := range segments {
 		if segment.Type == "text" && len(merged) > 0 && merged[len(merged)-1].Type == "text" {
 			merged[len(merged)-1].Text += segment.Text

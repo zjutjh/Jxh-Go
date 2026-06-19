@@ -3,7 +3,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,14 +57,11 @@ type Options struct {
 }
 
 type Pipeline struct {
-	mu        sync.RWMutex
-	knowledge *cache.Knowledge
-	sender    Sender
-	ai        *ai.Service
-	reloader  Reloader
-	blacklist Blacklist
-	admin     *commands.AdminHandler
-	quote     QuoteGenerator
+	mu            sync.RWMutex
+	knowledge     *cache.Knowledge
+	sender        Sender
+	blacklist     Blacklist
+	commandRouter *GroupCommandRouter
 }
 
 func (p *Pipeline) SetSender(sender Sender) {
@@ -88,13 +84,10 @@ type GroupMessage struct {
 
 func NewPipeline(opts Options) *Pipeline {
 	return &Pipeline{
-		knowledge: opts.Knowledge,
-		sender:    opts.Sender,
-		ai:        opts.AI,
-		reloader:  opts.Reloader,
-		blacklist: opts.Blacklist,
-		admin:     opts.Admin,
-		quote:     opts.Quote,
+		knowledge:     opts.Knowledge,
+		sender:        opts.Sender,
+		blacklist:     opts.Blacklist,
+		commandRouter: NewGroupCommandRouter(opts),
 	}
 }
 
@@ -116,96 +109,11 @@ func (p *Pipeline) HandleGroupMessage(ctx context.Context, msg GroupMessage) err
 	if text == "" {
 		return nil
 	}
-	switch {
-	case text == "/test":
-		return sender.SendGroupText(ctx, msg.GroupID, "ddd")
-	case text == "/reload":
-		if p.reloader != nil {
-			if err := p.reloader.Reload(ctx); err != nil {
-				return sender.SendGroupText(ctx, msg.GroupID, "重载失败："+err.Error())
-			}
-		}
-		return sender.SendGroupText(ctx, msg.GroupID, "重载成功")
-	case text == "/q":
-		if p.quote == nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "引用图服务未初始化")
-		}
-		if msg.ReplyMessageID == 0 {
-			return sender.SendGroupText(ctx, msg.GroupID, "请回复一条消息后使用 /q")
-		}
-		getter, ok := sender.(QuoteMessageGetter)
-		if !ok {
-			return sender.SendGroupText(ctx, msg.GroupID, "NapCat 消息接口未初始化")
-		}
-		quoted, err := getter.GetQuoteMessage(ctx, msg.ReplyMessageID)
-		if err != nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "获取被引用消息失败："+err.Error())
-		}
-		content := quoteMessageContent(quoted.RawMessage, quoted.Message)
-		if isEmptyQuoteContent(content) {
-			return sender.SendGroupText(ctx, msg.GroupID, "被引用消息内容为空")
-		}
-		image, err := p.quote.Generate(ctx, quote.Payload{{
-			UserID:       quoted.UserID,
-			UserNickname: quoteNickname(quoted.Nickname),
-			Message:      content,
-		}})
-		if err != nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "引用图生成失败："+err.Error())
-		}
-		return sender.SendGroupMessage(ctx, msg.GroupID, map[string]any{"type": "image", "data": map[string]any{"file": quoteImageFile(image)}})
-	case strings.HasPrefix(text, "/ai"):
-		question := strings.TrimSpace(strings.TrimPrefix(text, "/ai"))
-		if p.ai == nil {
-			return sender.SendGroupText(ctx, msg.GroupID, ai.EmptyKnowledgeAnswer)
-		}
-		answer, err := p.ai.Answer(ctx, question)
-		if err != nil {
+	if p.commandRouter != nil {
+		handled, err := p.commandRouter.Handle(ctx, msg, sender)
+		if handled || err != nil {
 			return err
 		}
-		return sender.SendGroupText(ctx, msg.GroupID, answer)
-	case strings.HasPrefix(text, "/admin"):
-		adminText := strings.TrimSpace(strings.TrimPrefix(text, "/admin"))
-		if adminText == "restart" {
-			moderator, ok := sender.(Moderator)
-			if !ok {
-				return sender.SendGroupText(ctx, msg.GroupID, "NapCat 管理接口未初始化")
-			}
-			if err := moderator.SetRestart(ctx); err != nil {
-				return err
-			}
-			return sender.SendGroupText(ctx, msg.GroupID, "已请求重启 NapCat")
-		}
-		if strings.HasPrefix(adminText, "ban ") {
-			moderator, ok := sender.(Moderator)
-			if !ok {
-				return sender.SendGroupText(ctx, msg.GroupID, "NapCat 管理接口未初始化")
-			}
-			if len(msg.AtUsers) == 0 {
-				return sender.SendGroupText(ctx, msg.GroupID, "请 @ 要禁言的用户")
-			}
-			duration, err := parseBanDuration(strings.TrimSpace(strings.TrimPrefix(adminText, "ban ")))
-			if err != nil {
-				return sender.SendGroupText(ctx, msg.GroupID, "禁言时间格式不正确")
-			}
-			if err := moderator.SetGroupBan(ctx, msg.GroupID, msg.AtUsers[0], duration); err != nil {
-				return err
-			}
-			return sender.SendGroupText(ctx, msg.GroupID, "已禁言")
-		}
-		if p.admin == nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "管理命令未初始化")
-		}
-		resp, err := p.admin.Handle(ctx, commands.AdminInput{
-			ActorID: msg.UserID,
-			Text:    adminText,
-			AtUsers: msg.AtUsers,
-			IsOwner: msg.IsOwner,
-		})
-		if err != nil {
-			return err
-		}
-		return sender.SendGroupText(ctx, msg.GroupID, resp)
 	}
 	if p.knowledge != nil {
 		if entry, ok := p.knowledge.Lookup(text); ok {
@@ -213,37 +121,6 @@ func (p *Pipeline) HandleGroupMessage(ctx context.Context, msg GroupMessage) err
 		}
 	}
 	return nil
-}
-
-func quoteNickname(nickname string) string {
-	nickname = strings.TrimSpace(nickname)
-	if nickname == "" {
-		return "匿名"
-	}
-	return nickname
-}
-
-func quoteImageFile(image string) string {
-	image = strings.TrimSpace(image)
-	if strings.HasPrefix(image, "base64://") || strings.HasPrefix(image, "http://") || strings.HasPrefix(image, "https://") || strings.HasPrefix(image, "file://") {
-		return image
-	}
-	return "base64://" + image
-}
-
-func parseBanDuration(raw string) (time.Duration, error) {
-	fields := strings.Fields(raw)
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("empty duration")
-	}
-	if d, err := time.ParseDuration(fields[0]); err == nil {
-		return d, nil
-	}
-	seconds, err := strconv.ParseInt(fields[0], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return time.Duration(seconds) * time.Second, nil
 }
 
 func (p *Pipeline) HandleGroupIncrease(ctx context.Context, groupID int64, userID int64) error {
