@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/zjutjh/jxh-go/internal/knowledge"
 )
@@ -13,6 +14,7 @@ type KnowledgeRetriever struct {
 
 type KnowledgeRetrieverOptions struct {
 	ScoreThreshold float64
+	CacheTTL       time.Duration
 }
 
 func NewKnowledgeRetriever(entries []knowledge.Entry, options ...KnowledgeRetrieverOptions) KnowledgeRetriever {
@@ -23,6 +25,7 @@ func NewKnowledgeRetriever(entries []knowledge.Entry, options ...KnowledgeRetrie
 	return KnowledgeRetriever{Retriever: knowledge.NewRetrievalEngine(knowledge.RetrievalOptions{
 		Entries:        entries,
 		ScoreThreshold: opts.ScoreThreshold,
+		CacheTTL:       opts.CacheTTL,
 	})}
 }
 

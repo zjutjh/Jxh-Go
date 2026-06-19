@@ -53,7 +53,10 @@ func main() {
 	}
 	domainEntries := storage.ToKnowledgeEntries(entries)
 	knowledgeCache.Replace(knowledge.NewKeywordIndex(domainEntries))
-	knowledgeRetrieverOptions := ai.KnowledgeRetrieverOptions{ScoreThreshold: cfg.AI.ScoreThreshold}
+	knowledgeRetrieverOptions := ai.KnowledgeRetrieverOptions{
+		ScoreThreshold: cfg.AI.ScoreThreshold,
+		CacheTTL:       time.Duration(cfg.Cache.AIRetrievalTTLSec) * time.Second,
+	}
 	aiRetriever := ai.NewRetrieverRef(ai.NewKnowledgeRetriever(domainEntries, knowledgeRetrieverOptions))
 	knowledgeSync := knowledge.NewSyncer(knowledge.SyncerOptions{
 		Source: knowledge.WPSClient{

@@ -3,7 +3,10 @@ package knowledge
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
 
@@ -16,11 +19,21 @@ type RetrievedDocument struct {
 type RetrievalOptions struct {
 	Entries        []Entry
 	ScoreThreshold float64
+	CacheTTL       time.Duration
 }
 
 type RetrievalEngine struct {
 	entries        []Entry
 	scoreThreshold float64
+	cacheTTL       time.Duration
+	now            func() time.Time
+	mu             sync.Mutex
+	cache          map[string]retrievalCacheEntry
+}
+
+type retrievalCacheEntry struct {
+	expiresAt time.Time
+	docs      []RetrievedDocument
 }
 
 type TextRetriever struct {
@@ -35,7 +48,17 @@ func NewRetrievalEngine(opts RetrievalOptions) *RetrievalEngine {
 	return &RetrievalEngine{
 		entries:        append([]Entry(nil), opts.Entries...),
 		scoreThreshold: threshold,
+		cacheTTL:       opts.CacheTTL,
+		now:            time.Now,
+		cache:          map[string]retrievalCacheEntry{},
 	}
+}
+
+func (r *RetrievalEngine) CacheTTL() time.Duration {
+	if r == nil {
+		return 0
+	}
+	return r.cacheTTL
 }
 
 func NewTextRetriever(entries []Entry) *TextRetriever {
@@ -57,6 +80,10 @@ func (r *RetrievalEngine) Retrieve(ctx context.Context, query string, topK int) 
 	}
 	if topK <= 0 {
 		topK = 5
+	}
+	cacheKey := r.cacheKey(query, topK)
+	if docs, ok := r.getCached(cacheKey); ok {
+		return docs, nil
 	}
 	candidates := make(map[string]RetrievedDocument)
 	for _, entry := range r.entries {
@@ -90,7 +117,41 @@ func (r *RetrievalEngine) Retrieve(ctx context.Context, query string, topK int) 
 	if len(docs) > topK {
 		docs = docs[:topK]
 	}
+	r.setCached(cacheKey, docs)
 	return docs, nil
+}
+
+func (r *RetrievalEngine) cacheKey(query string, topK int) string {
+	return query + "\x00" + strconv.Itoa(topK)
+}
+
+func (r *RetrievalEngine) getCached(key string) ([]RetrievedDocument, bool) {
+	if r == nil || r.cacheTTL <= 0 {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cached, ok := r.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if !r.now().Before(cached.expiresAt) {
+		delete(r.cache, key)
+		return nil, false
+	}
+	return cloneRetrievedDocuments(cached.docs), true
+}
+
+func (r *RetrievalEngine) setCached(key string, docs []RetrievedDocument) {
+	if r == nil || r.cacheTTL <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache[key] = retrievalCacheEntry{
+		expiresAt: r.now().Add(r.cacheTTL),
+		docs:      cloneRetrievedDocuments(docs),
+	}
 }
 
 func recallEntry(entry Entry, query string) []RetrievedDocument {
@@ -132,6 +193,20 @@ func retrievalKey(entry Entry) string {
 		return entry.SourceKey
 	}
 	return normalizeKey(entry.Keyword)
+}
+
+func cloneRetrievedDocuments(docs []RetrievedDocument) []RetrievedDocument {
+	if len(docs) == 0 {
+		return nil
+	}
+	out := make([]RetrievedDocument, len(docs))
+	copy(out, docs)
+	for i := range out {
+		out[i].Entry.Aliases = append([]string(nil), docs[i].Entry.Aliases...)
+		out[i].Entry.Tags = append([]string(nil), docs[i].Entry.Tags...)
+		out[i].Sources = append([]string(nil), docs[i].Sources...)
+	}
+	return out
 }
 
 func queryTerms(query string) []string {
