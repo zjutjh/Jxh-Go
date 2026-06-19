@@ -34,8 +34,8 @@ services:
       retries: 10
 
   quote:
-    image: zhullyb/qq-quote-generator
-    container_name: qq-quote-generator
+    image: phlin996/qq-quote-go:latest
+    container_name: qq-quote-go
     profiles: ["quote"]
     ports:
       - "5000:5000"
