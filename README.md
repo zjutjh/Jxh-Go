@@ -54,10 +54,7 @@ cp config.example.yaml config.yaml
 # 2. 启动外部依赖
 NAPCAT_UID=$(id -u) NAPCAT_GID=$(id -g) docker compose up -d mysql napcat
 
-# 3. 运行测试
-go test ./...
-
-# 4. 启动 bot
+# 3. 启动 bot
 go run ./cmd/bot -config config.yaml
 ```
 
