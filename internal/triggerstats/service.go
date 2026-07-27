@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zjutjh/jxh-go/internal/safego"
 )
 
 const (
@@ -125,16 +127,22 @@ func (s *Service) RunPurgeLoop(ctx context.Context, retentionDays int) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for {
-		if deleted, err := s.PurgeOldLogs(ctx, retentionDays); err != nil {
-			log.Printf("purge trigger logs failed: %v", err)
-		} else if deleted > 0 {
-			log.Printf("purged %d old trigger log entries", deleted)
-		}
+		s.purgeOnce(ctx, retentionDays)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+func (s *Service) purgeOnce(ctx context.Context, retentionDays int) {
+	// 恢复边界放在每轮工作上，一轮 panic 不会让整个清理循环静默退出。
+	defer safego.Recover("trigger log purge")
+	if deleted, err := s.PurgeOldLogs(ctx, retentionDays); err != nil {
+		log.Printf("purge trigger logs failed: %v", err)
+	} else if deleted > 0 {
+		log.Printf("purged %d old trigger log entries", deleted)
 	}
 }
 

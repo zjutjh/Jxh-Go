@@ -20,11 +20,11 @@ Jxh-Go 是精弘 QQ 群助手的 Go 重构版本，面向浙江工业大学相�
 
 - **关键词回复**：从 WPS 回复表导入 `keyword`、`answer` 和 `aliases`，在群聊中精确匹配。
 - **菜单问答**：兼容 `%编号` 菜单树，导入时生成路径，方便回复和检索。
-- **AI 问答**：`/ai <问题>` 由 ReAct Agent 使用 AND、OR 或正则表达式搜索当前内存知识库。
+- **AI 问答**：`/ai <问题>` 由 ReAct Agent 使用 AND、OR 或正则表达式搜索当前内存知识库，并保持温和友好的精小弘人设。
 - **群管理**：当前群群主和群管理员可执行禁言、NapCat 重启和定时任务命令。
 - **引用图**：回复消息后发送 `/q [数量]`，生成最多 10 条消息的动态 GIF 引用图，失败时回退 PNG。
 - **分享链接净化**：自动展开 Bilibili、小红书短链，清除分享跟踪参数；支持纯文本和 QQ 小程序卡片。
-- **群申请登记**：登记 NapCat 群申请信息，支持管理员同步并在本地按来源群分别导出 Excel。
+- **群申请登记**：实时登记 NapCat 群申请，每 10 秒自动同步处理状态，并用 AI 提取学号、姓名和专业。
 - **词条统计**：用 MySQL 日志记录成功发送的关键词回复和 `/ai` 实际搜索命中的知识条目，导出时按词条合并两类次数。
 
 ## 快速开始
@@ -125,51 +125,57 @@ go run ./cmd/bot -config config.yaml
 | G | `status` | 启用状态 |
 | H | `source_id` | 稳定 ID，修改 keyword 时用于保留同一条记录 |
 
-`answer` 可以包含图片 CQ 标签，Bot 会在关键词精确回复时把它转换成文字和图片消息。本地图片使用固定的相对路径格式：
+`answer` 可以包含图片和文件 CQ 标签，Bot 会在关键词精确回复时按原顺序发送文字、图片和 QQ 闪传附件。本地媒体使用固定的相对路径格式：
 
 ```text
 校区地图：
 [CQ:image,file=maps/campus.png]
+[CQ:file,file=培养计划/人工智能.pdf]
 ```
 
-对应文件放在宿主机的 `data/media/maps/campus.png`。Compose 会把 `data/media/` 只读挂载到 NapCat 的 `/app/jxh-media/`，Bot 发送时会把相对路径转换为该目录下的 `file://` URI。WPS 中只允许使用 `/` 分隔的相对路径；绝对路径、反斜杠、`.`、`..`、查询参数以及直接填写的 `file://`、`base64://` 都会被拒绝。
+对应文件分别放在宿主机的 `data/media/maps/campus.png` 和 `data/media/培养计划/人工智能.pdf`。Compose 会把 `data/media/` 只读挂载到 NapCat 的 `/app/jxh-media/`。WPS 中只允许使用 `/` 分隔的相对路径；绝对路径、反斜杠、`.`、`..`、查询参数以及直接填写的 `file://`、`base64://` 都会被拒绝。
 
-远程图片同时支持 `http://` 和 `https://`，可以写在 `url` 或 `file` 中；有效的 `url` 优先于 `file`。图片链接无效、本地文件不存在或 NapCat 无法读取时会保留周围文字；如果词条只有图片，Bot 会提示管理员检查图片链接。`/ai` 检索只使用去掉图片标签后的文字，不会向模型发送图片或图片 URL。
+远程图片和文件同时支持 `http://` 与 `https://`，可以写在 `url` 或 `file` 中；有效的 `url` 优先于 `file`。文件显示名自动取 URL 或相对路径的最后一段，不需要额外参数，例如：
+
+```text
+[CQ:file,file=https://cube.phlin.cn/files/qqbot/2026培养计划/人工智能.pdf]
+```
+
+远程文件由 bot 下载到 `data/flash/` 后交给 NapCat，通过 QQ 闪传发送为聊天里的临时附件，不会上传到群文件。下载限制为单文件 100 MiB、最多 3 次跳转、2 分钟和同时 2 个任务，并拒绝凭据、非常用端口及内网/本机目标。相同来源在 24 小时内复用暂存文件；暂存总量最多 512 MiB、128 个文件，后续下载时会清理超过 24 小时的内容。图片或文件无效时会在对应位置给出提示并继续发送后续内容；失败提示不会回显可能含签名参数的源 URL。`/ai` 检索只使用去掉图片和文件标签后的文字，不会向模型发送媒体内容或 URL。
 
 导入器会解析 `%编号` 菜单树，并生成 `path` 和 AI 检索用的 `content`。
 
 ## 常用命令
 
-群聊里的 `/` 命令可以直接触发，例如 `/test`。@bot 但不附带命令时会显示命令菜单，普通关键词回复也不需要 @bot。
+除 `/admin` 外，群聊里的 `/` 命令都可以直接触发，例如 `/test`。`/admin` 及其子命令必须先 @bot；@bot 但不附带命令时会显示命令菜单，普通关键词回复也不需要 @bot。
 
 发送带跟踪参数的 `bilibili.com` 链接，或分享 `b23.tv`、`xhslink.com` 以及对应 QQ 小程序卡片时，bot 会额外回复净化后的直链。Bilibili 链接删除全部查询参数；小红书链接仅保留访问所需的 `xsec_token`。
 
 | 命令 | 说明 |
 | --- | --- |
 | `@bot` | 查看普通命令菜单；关键词和别名无需 @bot |
-| `/admin` | 查看管理员命令说明和权限提示 |
+| `@bot /admin` | 查看管理员命令说明和权限提示；所有 `/admin` 命令都必须 @bot |
 | `/test` | 连通性测试 |
 | `/reload` | 从 WPS 同步知识库，并刷新缓存 |
 | `/ai <问题>` | 让 Agent 自主搜索当前知识库并回答；同时最多处理 2 个请求 |
 | `/q [数量]` | 生成被回复消息及其之前的 1–10 条消息引用图；默认 1 条 |
-| `/admin restart` | 请求 NapCat 重启 |
-| `/admin ban <时长> @用户1 [@用户2 ...]` | 批量禁言被 @ 的用户；时长支持 `10m`、`1h` 或秒数 |
+| `@bot /admin restart` | 请求 NapCat 重启 |
+| `@bot /admin ban <时长> @用户1 [@用户2 ...]` | 批量禁言被 @ 的用户；时长支持 `10m`、`1h` 或秒数 |
 
 管理员中文子命令：
 
 | 命令 | 说明 |
 | --- | --- |
-| `/admin 定时任务 查看` | 查看定时任务 |
-| `/admin 定时任务 添加 每天 <HH:MM> <群聊ID> <消息内容>` | 添加每日任务 |
-| `/admin 定时任务 添加 单次 <YYYY-MM-DD HH:MM> <群聊ID> <消息内容>` | 添加指定日期执行的单次任务 |
-| `/admin 定时任务 移除 <任务ID>` | 移除定时任务 |
-| `/admin 群申请 同步 [数量]` | 从 NapCat 群系统消息补同步近期加群申请，默认 20 条 |
-| `/admin 群申请 导出 [全部|最近N]` | 将所有群申请按来源群分别导出到本地 `data/exports/group_requests/` |
-| `/admin 词条统计 [7d|30d|全部]` | 将所有群的关键词回复和 `/ai` 检索统计导出到本地 Excel |
+| `@bot /admin 定时任务 查看` | 查看定时任务 |
+| `@bot /admin 定时任务 添加 每天 <HH:MM> <当前群ID> <消息内容>` | 为当前群添加每日任务 |
+| `@bot /admin 定时任务 添加 单次 <YYYY-MM-DD HH:MM> <当前群ID> <消息内容>` | 为当前群添加指定日期执行的单次任务 |
+| `@bot /admin 定时任务 移除 <任务ID>` | 移除当前群的定时任务 |
+| `@bot /admin 群申请 导出 [数量]` | 不填数量时导出全部；填写正整数时导出最新 N 条，并按来源群分别保存到本地 `data/exports/group_requests/` |
+| `@bot /admin 词条统计 [7d|30d|全部]` | 将所有群的关键词回复和 `/ai` 检索统计导出到本地 Excel |
 
-bot 会在每次执行 `/admin` 或 `/reload` 时通过 NapCat 查询执行者的实时群角色，只允许当前群群主和群管理员。角色不缓存也不写入 MySQL。NapCat 不能禁言群主、群管理员或机器人自己；禁言失败时 bot 会在群内返回错误原因和该限制提示。
+bot 只处理明确 @bot 的 `/admin` 命令，并会在每次执行 `/admin` 或 `/reload` 时通过 NapCat 查询执行者的实时群角色，只允许当前群群主和群管理员。角色不缓存也不写入 MySQL。定时任务按群隔离，只能在当前群查看、添加和移除。NapCat 不能禁言群主、群管理员或机器人自己；禁言失败时 bot 会在群内返回错误原因和该限制提示。
 
-群申请和词条统计面向后台维护人员，导出文件只保存在 bot 本地，不上传到 QQ 群文件。群申请一次查询所有群的数据，并在单次批次目录中按来源群号生成独立 Excel；词条统计跨群汇总为一个 Excel。系统消息中尚未处理的申请状态为 `pending`，已处理但无法判断批准或拒绝的状态为 `observed`。
+群申请和词条统计面向后台维护人员，导出文件只保存在 bot 本地，不上传到 QQ 群文件。群申请事件会实时入库；每次连接 NapCat 后立即读取最近 100 条群系统消息，之后每 10 秒自动同步一次。系统消息中尚未处理的申请状态为 `pending`，已处理但无法判断批准或拒绝的状态为 `processed`，记录不会因处理完成而删除。启用 AI 时，加入申请会异步提取学号、姓名和专业；存在“答案：”时只把答案部分发送给模型，单个字段不可信时只丢弃该字段。原始验证信息先入库，解析失败不会丢失申请；执行 `006_reparse_group_request_applicants.sql` 后，历史 `add` 申请中尚未完成 AI 解析的记录会重新排队。部署时应确认模型服务的数据处理政策。导出一次查询所有群的数据，并在单次批次目录中按来源群号生成独立 Excel；词条统计跨群汇总为一个 Excel。
 
 ## 配置和环境变量
 
@@ -198,10 +204,10 @@ bot 会在每次执行 `/admin` 或 `/reload` 时通过 NapCat 查询执行者�
 
 AI 行为：
 
-- `ai.enabled: false`：`/ai` 返回未启用。
-- 未配置 `ai.api_key` 或 `ai.model`：`/ai` 返回未启用。
+- `ai.enabled: false`：`/ai` 返回未启用，新群申请跳过 AI 字段提取。
+- 未配置 `ai.api_key` 或 `ai.model`：`/ai` 返回未启用，新群申请跳过 AI 字段提取。
 - `ai.provider: ark` 时，`ai.model` 填方舟推理接入点 ID，例如 `ep-xxxxxxxx`。
-- Agent 必须先搜索知识库，优先使用 AND 精确查询核心词，结果不足时再逐步删减条件、替换同义词或使用 OR/正则放宽。回答只能依据搜索结果；无命中或依据不足时由模型如实说明，不使用自身知识猜测。`7d` 和 `30d` 分别表示应用时区内含今天的最近 7 个和 30 个自然日。
+- Agent 必须先搜索知识库，优先使用 AND 精确查询核心词，结果不足时再逐步删减条件、替换同义词或使用 OR/正则放宽。单次回答最多实际搜索三次，第三次返回后必须使用已有结果收束回答；无命中时由程序返回温和的提问引导，不放行模型自由回答。每个有知识依据的候选回答都会额外调用一次同配置的独立审查模型，以结构化 JSON 判断是否允许、重写或拒绝；简体、繁体、变体字和夹杂外语适用相同规则。精小弘必须保持温和友好的迎新助手身份，冷酷、暴躁等风格请求只降级为无攻击性的直白表达或轻度玩梗，不模仿现实人物或其他人格。审查调用失败、响应格式错误或拒绝回答时返回固定友好提示，不放行未经审查的候选回答。`7d` 和 `30d` 分别表示应用时区内含今天的最近 7 个和 30 个自然日。
 
 ## 引用图服务
 
@@ -218,7 +224,7 @@ quote:
 
 项目采用 schema-first，运行时不使用 `AutoMigrate`。表结构以 `deploy/mysql/init/001_schema.sql` 为准。
 
-MySQL 首次初始化时会自动执行该 SQL。最终只包含 `knowledge_trigger_logs`、`scheduled_jobs` 和 `group_join_requests` 三张表，统一使用 `utf8mb4_0900_ai_ci`。已有部署按版本顺序手工执行 `deploy/mysql/migrations/` 中尚未应用的 SQL；初始化脚本只会在空数据目录首次启动时执行。
+MySQL 首次初始化时会自动执行该 SQL。最终只包含 `knowledge_trigger_logs`、`scheduled_jobs` 和 `group_join_requests` 三张表；表默认使用 `utf8mb4_0900_ai_ci`，不透明标识符 `source_key` 和 `flag` 单独使用 `utf8mb4_bin`，避免不同大小写或重音的值被合并。已有部署按版本顺序手工执行 `deploy/mysql/migrations/` 中尚未应用的 SQL；群申请自动同步需要按顺序执行 `005_automate_group_request_processing.sql`、`006_reparse_group_request_applicants.sql` 和 `007_remove_group_request_system_request_id.sql`。初始化脚本只会在空数据目录首次启动时执行。
 
 需要重建空库时：
 
@@ -249,7 +255,7 @@ make compose-logs  # 查看 compose 日志
 | `internal/bot` | 群消息处理管线和命令路由 |
 | `internal/commands` | 群管理和定时任务命令 |
 | `internal/knowledge` | WPS 解析、原子内存索引和 Agent 搜索 |
-| `internal/ai` | `/ai` ReAct Agent、知识搜索工具和 Eino 模型适配 |
+| `internal/ai` | `/ai` ReAct Agent、知识搜索工具和群申请字段提取 |
 | `internal/storage` | GORM 数据访问和数据库模型；表结构以初始化 SQL 为准 |
 | `internal/triggerstats` | MySQL-backed 词条触发统计 |
 | `internal/napcat` | NapCat SDK 适配层 |

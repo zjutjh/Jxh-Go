@@ -15,6 +15,7 @@ type EinoModelConfig struct {
 	BaseURL  string
 	APIKey   string
 	Model    string
+	JSONOnly bool
 }
 
 func NewEinoModel(ctx context.Context, cfg EinoModelConfig) (model.ToolCallingChatModel, error) {
@@ -30,17 +31,27 @@ func NewEinoModel(ctx context.Context, cfg EinoModelConfig) (model.ToolCallingCh
 		if cfg.BaseURL == "" {
 			return nil, fmt.Errorf("eino model config is incomplete")
 		}
-		return openaimodel.NewChatModel(ctx, &openaimodel.ChatModelConfig{
+		modelConfig := &openaimodel.ChatModelConfig{
 			BaseURL: cfg.BaseURL,
 			APIKey:  cfg.APIKey,
 			Model:   cfg.Model,
-		})
+		}
+		if cfg.JSONOnly {
+			modelConfig.ResponseFormat = &openaimodel.ChatCompletionResponseFormat{
+				Type: openaimodel.ChatCompletionResponseFormatTypeJSONObject,
+			}
+		}
+		return openaimodel.NewChatModel(ctx, modelConfig)
 	case "ark":
-		return arkmodel.NewChatModel(ctx, &arkmodel.ChatModelConfig{
+		modelConfig := &arkmodel.ChatModelConfig{
 			BaseURL: cfg.BaseURL,
 			APIKey:  cfg.APIKey,
 			Model:   cfg.Model,
-		})
+		}
+		if cfg.JSONOnly {
+			modelConfig.ResponseFormat = &arkmodel.ResponseFormat{Type: "json_object"}
+		}
+		return arkmodel.NewChatModel(ctx, modelConfig)
 	default:
 		return nil, fmt.Errorf("unsupported eino model provider: %s", cfg.Provider)
 	}

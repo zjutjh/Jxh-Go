@@ -13,6 +13,7 @@ import (
 	"github.com/zjutjh/jxh-go/internal/grouprequest"
 	"github.com/zjutjh/jxh-go/internal/knowledge"
 	"github.com/zjutjh/jxh-go/internal/quote"
+	"github.com/zjutjh/jxh-go/internal/safego"
 	"github.com/zjutjh/jxh-go/internal/triggerstats"
 	"github.com/zjutjh/napcat-sdk/message"
 )
@@ -34,19 +35,19 @@ const botHelpText = `精小弘命令菜单：
 /reload - 重新加载知识库（刷新精小弘的记忆？！）
 /ai <问题> - 用大模型查找一些知识库中的答案（让精小弘更聪明？！）
 /q [数量] - 生成被回复消息及其之前最多 10 条消息的引用图（表情包生成器ww）
-/admin - 查看管理员命令和权限说明
+@bot /admin - 查看管理员命令和权限说明（必须 @精小弘）
 访问 https://status.fridayssheep.top/status/jxh 来确定精小弘是否正常！`
 
 const adminHelpText = `管理员命令（当前群群主或群管理员可使用）：
-/admin ban <时长> @用户1 @用户2 ... - 禁言不听话的小朋友（可批量）
-/admin restart - 重启 NapCat 框架
-/admin 定时任务 查看
-/admin 定时任务 添加 每天 <HH:MM> <群号> <消息>
-/admin 定时任务 添加 单次 <YYYY-MM-DD HH:MM> <群号> <消息>
-/admin 定时任务 移除 <任务ID>
-/admin 群申请 同步 [数量]
-/admin 群申请 导出 [全部|最近N] - 本地按来源群分文件
-/admin 词条统计 [7d|30d|全部] - 本地导出全部群统计
+以下命令必须先 @精小弘：
+@bot /admin ban <时长> @用户1 @用户2 ... - 禁言不听话的小朋友（可批量）
+@bot /admin restart - 重启 NapCat 框架
+@bot /admin 定时任务 查看
+@bot /admin 定时任务 添加 每天 <HH:MM> <当前群号> <消息>
+@bot /admin 定时任务 添加 单次 <YYYY-MM-DD HH:MM> <当前群号> <消息>
+@bot /admin 定时任务 移除 <任务ID>
+@bot /admin 群申请 导出 [数量] - 不填数量时导出全部，本地按来源群分文件
+@bot /admin 词条统计 [7d|30d|全部] - 本地导出全部群统计
 精小弘不能禁言群主、群管理员或机器人自己ε=( o｀ω′)ノ`
 
 func NewGroupCommandRouter(opts Options) *GroupCommandRouter {
@@ -79,6 +80,9 @@ func (r *GroupCommandRouter) Handle(ctx context.Context, msg GroupMessage, sende
 	case text == "/ai" || strings.HasPrefix(text, "/ai "):
 		return true, r.startAI(ctx, msg, sender, text)
 	case text == "/admin" || strings.HasPrefix(text, "/admin "):
+		if !mentionsSelf(msg) {
+			return false, nil
+		}
 		return true, r.handleAdmin(ctx, msg, sender, text)
 	default:
 		return false, nil
@@ -103,7 +107,9 @@ func (r *GroupCommandRouter) handleReload(ctx context.Context, msg GroupMessage,
 		return err
 	}
 	if err := r.reloader.Sync(ctx); err != nil {
-		return sender.SendGroupText(ctx, msg.GroupID, "重载失败："+err.Error())
+		// 底层 *url.Error 会带上完整的 WPS 分享地址（含 query 参数），不能进群。
+		log.Printf("reload knowledge failed: group=%d: %v", msg.GroupID, err)
+		return sender.SendGroupText(ctx, msg.GroupID, "重载失败，请联系管理员查看服务日志")
 	}
 	return sender.SendGroupText(ctx, msg.GroupID, "重载成功")
 }
@@ -118,7 +124,8 @@ func (r *GroupCommandRouter) handleQuote(ctx context.Context, msg GroupMessage, 
 	}
 	quoted, err := sender.GetQuoteMessages(ctx, msg.GroupID, msg.ReplyMessageID, count)
 	if err != nil {
-		return sender.SendGroupText(ctx, msg.GroupID, "获取被引用消息失败："+err.Error())
+		log.Printf("get quote messages failed: group=%d message=%d: %v", msg.GroupID, msg.ReplyMessageID, err)
+		return sender.SendGroupText(ctx, msg.GroupID, "获取被引用消息失败，请稍后再试")
 	}
 	inputs := make([]quote.MessageInput, 0, len(quoted))
 	for _, message := range quoted {
@@ -133,7 +140,9 @@ func (r *GroupCommandRouter) handleQuote(ctx context.Context, msg GroupMessage, 
 	}
 	image, err := r.quote.Generate(ctx, payload)
 	if err != nil {
-		return sender.SendGroupText(ctx, msg.GroupID, "引用图生成失败："+err.Error())
+		// quote 客户端会把服务端响应正文拼进错误，不能直接发进群。
+		log.Printf("generate quote image failed: group=%d: %v", msg.GroupID, err)
+		return sender.SendGroupText(ctx, msg.GroupID, "引用图生成失败，请稍后再试")
 	}
 	return sender.SendGroupMessage(ctx, msg.GroupID, message.ChainOf(message.Image("base64://"+image)))
 }
@@ -161,6 +170,8 @@ func (r *GroupCommandRouter) startAI(ctx context.Context, msg GroupMessage, send
 	case r.aiSlots <- struct{}{}:
 		go func() {
 			defer func() { <-r.aiSlots }()
+			// 问题文本与模型输出都不可信，未恢复的 panic 会终止整个进程。
+			defer safego.Recover("ai command")
 			if err := r.handleAI(ctx, msg, sender, text); err != nil {
 				log.Printf("handle ai command failed: %v", err)
 				if sendErr := sender.SendGroupText(ctx, msg.GroupID, "AI问答失败，请稍后再试"); sendErr != nil {
@@ -179,6 +190,11 @@ func (r *GroupCommandRouter) handleAI(ctx context.Context, msg GroupMessage, sen
 	answer, sourceKeys, err := r.ai.AnswerWithSources(ctx, question)
 	if err != nil {
 		return err
+	}
+	// 空文本会被 QQ 渲染成不可查看的消息，这里兜底避免任何上游路径下发空串。
+	if strings.TrimSpace(answer) == "" {
+		log.Printf("ai answer was empty for group %d, sending fallback", msg.GroupID)
+		answer = ai.EmptyKnowledgeAnswer
 	}
 	if err := sender.SendGroupText(ctx, msg.GroupID, answer); err != nil {
 		return err
@@ -235,7 +251,7 @@ func (r *GroupCommandRouter) handleAdmin(ctx context.Context, msg GroupMessage, 
 		}
 		return sender.SendGroupText(ctx, msg.GroupID, fmt.Sprintf("已禁言 %d 人", len(atUsers)))
 	}
-	resp, err := r.admin.Execute(ctx, adminText)
+	resp, err := r.admin.Execute(ctx, msg.GroupID, adminText)
 	if err != nil {
 		return err
 	}
@@ -264,7 +280,7 @@ func (r *GroupCommandRouter) handleGroupRequestAdmin(ctx context.Context, msg Gr
 	case strings.HasPrefix(text, "导出"):
 		limit, err := parseOptionalLimit(strings.TrimSpace(strings.TrimPrefix(text, "导出")))
 		if err != nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "格式：/admin 群申请 导出 [全部|最近N]")
+			return sender.SendGroupText(ctx, msg.GroupID, "格式：@bot /admin 群申请 导出 [正整数]")
 		}
 		result, err := r.groupRequests.Export(ctx, limit)
 		if err != nil {
@@ -273,34 +289,16 @@ func (r *GroupCommandRouter) handleGroupRequestAdmin(ctx context.Context, msg Gr
 		if result.Count == 0 {
 			return sender.SendGroupText(ctx, msg.GroupID, "暂无群申请记录可导出")
 		}
-		return sender.SendGroupText(ctx, msg.GroupID, fmt.Sprintf("已在本地导出全部群申请 %d 条，按 %d 个群分别保存到：%s", result.Count, len(result.Files), result.Dir))
-	case strings.HasPrefix(text, "同步"):
-		limit, err := parseOptionalLimit(strings.TrimSpace(strings.TrimPrefix(text, "同步")))
-		if err != nil {
-			return sender.SendGroupText(ctx, msg.GroupID, "格式：/admin 群申请 同步 [数量]")
-		}
-		if limit <= 0 {
-			limit = 20
-		}
-		records, err := sender.FetchGroupJoinRequests(ctx, limit)
-		if err != nil {
-			return err
-		}
-		for _, record := range records {
-			if err := r.groupRequests.Record(ctx, record); err != nil {
-				return err
-			}
-		}
-		return sender.SendGroupText(ctx, msg.GroupID, fmt.Sprintf("已同步群申请 %d 条", len(records)))
+		return sender.SendGroupText(ctx, msg.GroupID, fmt.Sprintf("已在本地导出群申请 %d 条，按 %d 个群分别保存到：%s", result.Count, len(result.Files), result.Dir))
 	default:
-		return sender.SendGroupText(ctx, msg.GroupID, "格式：/admin 群申请 <同步|导出>")
+		return sender.SendGroupText(ctx, msg.GroupID, "格式：@bot /admin 群申请 导出 [正整数]")
 	}
 }
 
 func (r *GroupCommandRouter) handleTriggerStats(ctx context.Context, msg GroupMessage, sender Sender, text string) error {
 	days, err := parseStatsDays(text)
 	if err != nil {
-		return sender.SendGroupText(ctx, msg.GroupID, "格式：/admin 词条统计 [7d|30d|全部]")
+		return sender.SendGroupText(ctx, msg.GroupID, "格式：@bot /admin 词条统计 [7d|30d|全部]")
 	}
 	result, err := r.triggerStats.ExportForDays(ctx, days)
 	if err != nil {
@@ -346,11 +344,10 @@ func parseBanDuration(raw string) (time.Duration, error) {
 
 func parseOptionalLimit(raw string) (int, error) {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || raw == "全部" {
+	if raw == "" {
 		return 0, nil
 	}
-	raw = strings.TrimPrefix(raw, "最近")
-	limit, err := strconv.Atoi(strings.TrimSpace(raw))
+	limit, err := strconv.Atoi(raw)
 	if err != nil || limit <= 0 {
 		return 0, fmt.Errorf("invalid limit")
 	}

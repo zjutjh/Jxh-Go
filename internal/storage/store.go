@@ -62,9 +62,9 @@ func (s *Store) PurgeOldTriggerLogs(ctx context.Context, before time.Time) (int6
 	return result.RowsAffected, result.Error
 }
 
-func (s *Store) ListScheduledJobs(ctx context.Context) ([]commands.ScheduledJobView, error) {
+func (s *Store) ListScheduledJobs(ctx context.Context, groupID int64) ([]commands.ScheduledJobView, error) {
 	var jobs []ScheduledJob
-	if err := s.db.WithContext(ctx).Where("enabled = ?", true).Order("id").Find(&jobs).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("group_id = ? AND enabled = ?", groupID, true).Order("id").Find(&jobs).Error; err != nil {
 		return nil, err
 	}
 	out := make([]commands.ScheduledJobView, 0, len(jobs))
@@ -90,7 +90,7 @@ func (s *Store) AddScheduledJob(ctx context.Context, input commands.ScheduledJob
 		Message:  input.Message,
 		Enabled:  true,
 	}
-	if input.Type == scheduler.JobTypeDaily && input.CreatedAt.Format("15:04") >= input.TimeHHMM {
+	if input.Type == scheduler.JobTypeDaily && scheduler.TimeReached(input.CreatedAt, input.TimeHHMM) {
 		createdAt := input.CreatedAt
 		job.LastRunAt = &createdAt
 	}
@@ -98,8 +98,8 @@ func (s *Store) AddScheduledJob(ctx context.Context, input commands.ScheduledJob
 	return job.ID, err
 }
 
-func (s *Store) RemoveScheduledJob(ctx context.Context, id uint64) (bool, error) {
-	result := s.db.WithContext(ctx).Model(&ScheduledJob{}).Where("id = ?", id).Update("enabled", false)
+func (s *Store) RemoveScheduledJob(ctx context.Context, groupID int64, id uint64) (bool, error) {
+	result := s.db.WithContext(ctx).Model(&ScheduledJob{}).Where("id = ? AND group_id = ?", id, groupID).Update("enabled", false)
 	return result.RowsAffected > 0, result.Error
 }
 
@@ -134,27 +134,55 @@ func (s *Store) MarkScheduledJobRan(ctx context.Context, id uint64, at time.Time
 
 func (s *Store) UpsertGroupJoinRequest(ctx context.Context, record grouprequest.Record) error {
 	model := groupJoinRequestToModel(record)
+	updates := map[string]any{
+		"group_id":     model.GroupID,
+		"user_id":      model.UserID,
+		"sub_type":     model.SubType,
+		"comment":      model.Comment,
+		"source":       model.Source,
+		"raw_json":     model.RawJSON,
+		"requested_at": model.RequestedAt,
+		"last_seen_at": model.LastSeenAt,
+	}
+	if record.Source == grouprequest.SourceSystem {
+		updates = systemGroupRequestUpdates(record)
+	}
 	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "flag"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"group_id":     model.GroupID,
-			"user_id":      model.UserID,
-			"student_id":   model.StudentID,
-			"student_name": model.StudentName,
-			"sub_type":     model.SubType,
-			"comment":      model.Comment,
-			"status":       model.Status,
-			"source":       model.Source,
-			"raw_json":     model.RawJSON,
-			"requested_at": model.RequestedAt,
-			"last_seen_at": model.LastSeenAt,
-		}),
+		Columns:   []clause.Column{{Name: "flag"}},
+		DoUpdates: clause.Assignments(updates),
 	}).Create(&model).Error
+}
+
+func systemGroupRequestUpdates(record grouprequest.Record) map[string]any {
+	updates := map[string]any{
+		"group_id": record.GroupID,
+		"user_id":  record.UserID,
+		"sub_type": record.SubType,
+		"comment":  record.Comment,
+		"status": gorm.Expr(
+			"IF(status = ?, status, ?)", grouprequest.StatusProcessed, record.Status,
+		),
+		"system_raw_json": record.SystemRawJSON,
+		"last_seen_at":    record.LastSeenAt,
+	}
+	if record.StudentID != "" {
+		updates["student_id"] = record.StudentID
+	}
+	if record.StudentName != "" {
+		updates["student_name"] = record.StudentName
+	}
+	if record.Major != "" {
+		updates["major"] = record.Major
+	}
+	if record.ProcessedAt != nil {
+		updates["processed_at"] = gorm.Expr("COALESCE(processed_at, ?)", *record.ProcessedAt)
+	}
+	return updates
 }
 
 func (s *Store) ListGroupJoinRequests(ctx context.Context, limit int) ([]grouprequest.Record, error) {
 	var models []GroupJoinRequest
-	query := s.db.WithContext(ctx).Order("last_seen_at DESC").Order("id DESC")
+	query := s.db.WithContext(ctx).Order("requested_at DESC").Order("id DESC")
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -168,40 +196,99 @@ func (s *Store) ListGroupJoinRequests(ctx context.Context, limit int) ([]groupre
 	return records, nil
 }
 
+func (s *Store) ListPendingGroupJoinRequests(ctx context.Context, limit int) ([]grouprequest.Record, error) {
+	var models []GroupJoinRequest
+	query := s.db.WithContext(ctx).
+		Where("ai_parse_status = ? AND sub_type = ?", grouprequest.AIParsePending, "add").
+		Order("id")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if err := query.Find(&models).Error; err != nil {
+		return nil, err
+	}
+	records := make([]grouprequest.Record, 0, len(models))
+	for _, model := range models {
+		records = append(records, groupJoinRequestFromModel(model))
+	}
+	return records, nil
+}
+
+func (s *Store) CompleteGroupJoinRequestAI(ctx context.Context, id uint64, fields grouprequest.ExtractedFields, at time.Time) error {
+	updates := map[string]any{
+		"ai_parse_status": grouprequest.AIParseCompleted,
+		"ai_parsed_at":    at,
+	}
+	if fields.StudentID != "" {
+		updates["student_id"] = fields.StudentID
+	}
+	if fields.StudentName != "" {
+		updates["student_name"] = fields.StudentName
+	}
+	if fields.Major != "" {
+		updates["major"] = fields.Major
+	}
+	return s.db.WithContext(ctx).Model(&GroupJoinRequest{}).
+		Where("id = ? AND ai_parse_status = ?", id, grouprequest.AIParsePending).
+		Updates(updates).Error
+}
+
+func (s *Store) FailGroupJoinRequestAI(ctx context.Context, id uint64, maxAttempts int) error {
+	return s.db.WithContext(ctx).Exec(
+		`UPDATE group_join_requests
+SET ai_parse_status = IF(ai_parse_attempts + 1 >= ?, ?, ?),
+    ai_parse_attempts = ai_parse_attempts + 1
+WHERE id = ? AND ai_parse_status = ?`,
+		maxAttempts, grouprequest.AIParseFailed, grouprequest.AIParsePending, id, grouprequest.AIParsePending,
+	).Error
+}
+
 func groupJoinRequestToModel(record grouprequest.Record) GroupJoinRequest {
 	return GroupJoinRequest{
-		ID:          record.ID,
-		Flag:        record.Flag,
-		GroupID:     record.GroupID,
-		UserID:      record.UserID,
-		StudentID:   record.StudentID,
-		StudentName: record.StudentName,
-		SubType:     record.SubType,
-		Comment:     record.Comment,
-		Status:      record.Status,
-		Source:      record.Source,
-		RawJSON:     record.RawJSON,
-		RequestedAt: record.RequestedAt,
-		FirstSeenAt: record.FirstSeenAt,
-		LastSeenAt:  record.LastSeenAt,
+		ID:              record.ID,
+		Flag:            record.Flag,
+		GroupID:         record.GroupID,
+		UserID:          record.UserID,
+		StudentID:       record.StudentID,
+		StudentName:     record.StudentName,
+		Major:           record.Major,
+		SubType:         record.SubType,
+		Comment:         record.Comment,
+		Status:          record.Status,
+		Source:          record.Source,
+		RawJSON:         record.RawJSON,
+		SystemRawJSON:   record.SystemRawJSON,
+		AIParseStatus:   record.AIParseStatus,
+		AIParseAttempts: record.AIParseAttempts,
+		RequestedAt:     record.RequestedAt,
+		ProcessedAt:     record.ProcessedAt,
+		FirstSeenAt:     record.FirstSeenAt,
+		LastSeenAt:      record.LastSeenAt,
+		AIParsedAt:      record.AIParsedAt,
 	}
 }
 
 func groupJoinRequestFromModel(model GroupJoinRequest) grouprequest.Record {
 	return grouprequest.Record{
-		ID:          model.ID,
-		Flag:        model.Flag,
-		GroupID:     model.GroupID,
-		UserID:      model.UserID,
-		StudentID:   model.StudentID,
-		StudentName: model.StudentName,
-		SubType:     model.SubType,
-		Comment:     model.Comment,
-		Status:      model.Status,
-		Source:      model.Source,
-		RawJSON:     model.RawJSON,
-		RequestedAt: model.RequestedAt,
-		FirstSeenAt: model.FirstSeenAt,
-		LastSeenAt:  model.LastSeenAt,
+		ID:              model.ID,
+		Flag:            model.Flag,
+		GroupID:         model.GroupID,
+		UserID:          model.UserID,
+		StudentID:       model.StudentID,
+		StudentName:     model.StudentName,
+		Major:           model.Major,
+		SubType:         model.SubType,
+		Comment:         model.Comment,
+		Status:          model.Status,
+		Source:          model.Source,
+		RawJSON:         model.RawJSON,
+		SystemRawJSON:   model.SystemRawJSON,
+		AIParseStatus:   model.AIParseStatus,
+		AIParseAttempts: model.AIParseAttempts,
+		RequestedAt:     model.RequestedAt,
+		ProcessedAt:     model.ProcessedAt,
+		FirstSeenAt:     model.FirstSeenAt,
+		LastSeenAt:      model.LastSeenAt,
+		AIParsedAt:      model.AIParsedAt,
 	}
 }

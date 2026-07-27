@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/zjutjh/jxh-go/internal/bot"
+	"github.com/zjutjh/jxh-go/internal/flashfile"
 	"github.com/zjutjh/jxh-go/internal/grouprequest"
+	"github.com/zjutjh/jxh-go/internal/safego"
 	napcatsdk "github.com/zjutjh/napcat-sdk"
 	"github.com/zjutjh/napcat-sdk/api"
 	"github.com/zjutjh/napcat-sdk/event"
@@ -26,6 +30,7 @@ type Server struct {
 	RequestTimeout time.Duration
 	ReconnectDelay time.Duration
 	Handler        *bot.Pipeline
+	FlashFiles     *flashfile.Stager
 }
 
 func (s Server) Serve(ctx context.Context) error {
@@ -66,17 +71,26 @@ func (s Server) Serve(ctx context.Context) error {
 // off the read loop so a slow path (e.g. /reload) never blocks event intake.
 const maxConcurrentEvents = 32
 
+const (
+	groupRequestSyncCount    = 100
+	groupRequestSyncInterval = 10 * time.Second
+)
+
 func (s Server) consume(ctx context.Context, client *napcatsdk.Client) {
-	sender := SDKSender{client: client}
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sender := SDKSender{client: client, flashFiles: s.FlashFiles}
 	if s.Handler == nil {
 		return
 	}
 	s.Handler.SetSender(sender)
+	defer s.Handler.SetSender(nil)
+	go s.syncGroupJoinRequests(sessionCtx, sender)
 	slots := make(chan struct{}, maxConcurrentEvents)
 	events := client.Events()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-sessionCtx.Done():
 			return
 		case ev, ok := <-events:
 			if !ok {
@@ -87,15 +101,47 @@ func (s Server) consume(ctx context.Context, client *napcatsdk.Client) {
 			// spawning unbounded goroutines.
 			select {
 			case slots <- struct{}{}:
-			case <-ctx.Done():
+			case <-sessionCtx.Done():
 				return
 			}
 			go func(evt event.Event) {
 				defer func() { <-slots }()
-				if err := s.handleEvent(ctx, client, evt); err != nil {
+				// 事件处理链全程处理外部可控输入，未恢复的 panic 会终止整个进程。
+				defer safego.Recover("napcat event")
+				if err := s.handleEvent(sessionCtx, client, evt); err != nil {
 					log.Printf("handle napcat event failed: %v", err)
 				}
 			}(ev)
+		}
+	}
+}
+
+func (s Server) syncGroupJoinRequests(ctx context.Context, sender SDKSender) {
+	syncOnce := func() {
+		// 恢复边界放在每轮工作上，一轮 panic 不会让整个同步循环静默退出。
+		defer safego.Recover("group request sync")
+		records, err := sender.FetchGroupJoinRequests(ctx, groupRequestSyncCount)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("fetch group join requests for automatic sync failed: %v", err)
+			}
+			if len(records) == 0 {
+				return
+			}
+		}
+		if err := s.Handler.ReconcileGroupJoinRequests(ctx, records); err != nil && ctx.Err() == nil {
+			log.Printf("reconcile group join requests failed: %v", err)
+		}
+	}
+	syncOnce()
+	ticker := time.NewTicker(groupRequestSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			syncOnce()
 		}
 	}
 }
@@ -178,7 +224,8 @@ func extractReplyID(chain message.Chain) int64 {
 }
 
 type SDKSender struct {
-	client *napcatsdk.Client
+	client     *napcatsdk.Client
+	flashFiles *flashfile.Stager
 }
 
 func (s SDKSender) SendGroupText(ctx context.Context, groupID int64, text string) error {
@@ -196,6 +243,119 @@ func (s SDKSender) SendGroupMessage(ctx context.Context, groupID int64, msg mess
 		Message: encoded,
 	})
 	return err
+}
+
+func (s SDKSender) SendGroupFlashFile(ctx context.Context, groupID int64, source, name string) error {
+	if groupID <= 0 {
+		return fmt.Errorf("group ID must be positive")
+	}
+	filePath := source
+	if strings.HasPrefix(strings.ToLower(source), "http://") || strings.HasPrefix(strings.ToLower(source), "https://") {
+		if s.flashFiles == nil {
+			return fmt.Errorf("flash file stager is not initialized")
+		}
+		staged, err := s.flashFiles.Stage(ctx, source, name)
+		if err != nil {
+			return fmt.Errorf("stage remote flash file: %w", err)
+		}
+		filePath = staged
+	} else if path.Clean(source) != source || !strings.HasPrefix(source, "/app/jxh-media/") || path.Base(source) != name {
+		return fmt.Errorf("invalid local flash file source")
+	}
+
+	files, err := json.Marshal(filePath)
+	if err != nil {
+		return fmt.Errorf("encode flash file path: %w", err)
+	}
+	createResp, err := s.client.API().CreateFlashTask(ctx, api.CreateFlashTaskRequest{
+		Files: api.CreateFlashTaskRequestFilesUnion{Raw: files},
+		Name:  &name,
+	})
+	if err != nil {
+		return fmt.Errorf("create flash task: %w", err)
+	}
+	fileSetID, err := decodeCreateFlashResponse(createResp)
+	if err != nil {
+		return err
+	}
+	groupIDText := strconv.FormatInt(groupID, 10)
+	sendResp, err := s.client.API().SendFlashMsg(ctx, api.SendFlashMsgRequest{
+		FilesetID: fileSetID,
+		GroupID:   &groupIDText,
+	})
+	if err != nil {
+		return fmt.Errorf("send flash message: %w", err)
+	}
+	if err := validateSendFlashResponse(sendResp); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeCreateFlashResponse(value any) (string, error) {
+	var response struct {
+		Result                    *oneBotInt64 `json:"result"`
+		ErrMsg                    string       `json:"errMsg"`
+		CreateFlashTransferResult struct {
+			FileSetID string `json:"fileSetId"`
+		} `json:"createFlashTransferResult"`
+	}
+	if err := decodeDynamicValue(value, &response); err != nil {
+		return "", fmt.Errorf("decode create flash task response: %w", err)
+	}
+	if response.Result == nil {
+		return "", fmt.Errorf("create flash task response is missing result")
+	}
+	if *response.Result != 0 {
+		return "", fmt.Errorf("create flash task failed with result %d: %s", *response.Result, response.ErrMsg)
+	}
+	fileSetID := strings.TrimSpace(response.CreateFlashTransferResult.FileSetID)
+	if fileSetID == "" {
+		return "", fmt.Errorf("create flash task response is missing fileSetId")
+	}
+	return fileSetID, nil
+}
+
+func validateSendFlashResponse(value any) error {
+	var response struct {
+		ErrCode *oneBotInt64 `json:"errCode"`
+		ErrMsg  string       `json:"errMsg"`
+		Rsp     *struct {
+			SendStatus []struct {
+				Result *oneBotInt64 `json:"result"`
+				Msg    string       `json:"msg"`
+			} `json:"sendStatus"`
+		} `json:"rsp"`
+	}
+	if err := decodeDynamicValue(value, &response); err != nil {
+		return fmt.Errorf("decode send flash message response: %w", err)
+	}
+	if response.ErrCode == nil {
+		return fmt.Errorf("send flash message response is missing errCode")
+	}
+	if *response.ErrCode != 0 {
+		return fmt.Errorf("send flash message failed with errCode %d: %s", *response.ErrCode, response.ErrMsg)
+	}
+	if response.Rsp == nil || len(response.Rsp.SendStatus) == 0 {
+		return fmt.Errorf("send flash message response is missing sendStatus")
+	}
+	for i, status := range response.Rsp.SendStatus {
+		if status.Result == nil {
+			return fmt.Errorf("send flash message status %d is missing result", i+1)
+		}
+		if *status.Result != 0 {
+			return fmt.Errorf("send flash message status %d failed with result %d: %s", i+1, *status.Result, status.Msg)
+		}
+	}
+	return nil
+}
+
+func decodeDynamicValue(value, target any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(encoded, target)
 }
 
 type oneBotInt64 int64
@@ -374,13 +534,155 @@ func (s SDKSender) SetRestart(ctx context.Context) error {
 }
 
 func (s SDKSender) FetchGroupJoinRequests(ctx context.Context, count int) ([]grouprequest.Record, error) {
-	resp, err := s.client.API().GetGroupSystemMsg(ctx, api.GetGroupSystemMsgRequest{
-		Count: api.GetGroupSystemMsgRequestCountUnion{Raw: []byte(strconv.Itoa(count))},
-	})
-	if err != nil {
-		return nil, err
+	var resp struct {
+		InvitedRequests []json.RawMessage `json:"invited_requests"`
+		InvitedRequest  []json.RawMessage `json:"InvitedRequest"`
+		JoinRequests    []json.RawMessage `json:"join_requests"`
 	}
-	return grouprequest.RecordsFromSystemMessages(resp.JoinRequests, resp.InvitedRequests, time.Now()), nil
+	err := s.client.API().Call(ctx, string(api.ActionGetGroupSystemMsg), api.GetGroupSystemMsgRequest{
+		Count: api.GetGroupSystemMsgRequestCountUnion{Raw: []byte(strconv.Itoa(count))},
+	}, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("fetch group system messages: %w", err)
+	}
+	joinRequests, err := decodeGroupSystemMessages(resp.JoinRequests, false)
+	var decodeErrors []error
+	if err != nil {
+		decodeErrors = append(decodeErrors, fmt.Errorf("decode join requests: %w", err))
+	}
+	invitedRaw := resp.InvitedRequests
+	if len(invitedRaw) == 0 {
+		invitedRaw = resp.InvitedRequest
+	}
+	invitedRequests, err := decodeGroupSystemMessages(invitedRaw, true)
+	if err != nil {
+		decodeErrors = append(decodeErrors, fmt.Errorf("decode invited requests: %w", err))
+	}
+	return grouprequest.RecordsFromSystemMessages(joinRequests, invitedRequests), errors.Join(decodeErrors...)
+}
+
+type groupSystemMessageWire struct {
+	RequestID    json.RawMessage `json:"request_id"`
+	RequesterUin json.RawMessage `json:"requester_uin"`
+	RequesterID  json.RawMessage `json:"requester_id"`
+	UserID       json.RawMessage `json:"user_id"`
+	Uin          json.RawMessage `json:"uin"`
+	InvitorUin   json.RawMessage `json:"invitor_uin"`
+	GroupID      json.RawMessage `json:"group_id"`
+	Message      string          `json:"message"`
+	Checked      bool            `json:"checked"`
+}
+
+func decodeGroupSystemMessages(rawMessages []json.RawMessage, invited bool) ([]grouprequest.SystemMessage, error) {
+	messages := make([]grouprequest.SystemMessage, 0, len(rawMessages))
+	var decodeErrors []error
+	for i, raw := range rawMessages {
+		message, err := decodeGroupSystemMessage(raw, invited)
+		if err != nil {
+			decodeErrors = append(decodeErrors, fmt.Errorf("item %d: %w", i, err))
+			continue
+		}
+		messages = append(messages, message)
+	}
+	return messages, errors.Join(decodeErrors...)
+}
+
+func decodeGroupSystemMessage(raw json.RawMessage, invited bool) (grouprequest.SystemMessage, error) {
+	var wire groupSystemMessageWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return grouprequest.SystemMessage{}, fmt.Errorf("decode group system message: %w", err)
+	}
+	requestID, err := decimalJSONValue(wire.RequestID, "request_id", true)
+	if err != nil {
+		return grouprequest.SystemMessage{}, err
+	}
+	if strings.TrimLeft(requestID, "0") == "" {
+		return grouprequest.SystemMessage{}, fmt.Errorf("group system message request_id must be positive")
+	}
+	groupID, err := firstInt64JSONValue("group_id", wire.GroupID)
+	if err != nil {
+		return grouprequest.SystemMessage{}, err
+	}
+	var userID int64
+	if invited {
+		userID, err = firstInt64JSONValue("invitor_uin", wire.InvitorUin)
+	} else {
+		// Current NapCat versions expose the join applicant as invitor_uin.
+		// Prefer explicit requester fields if a future response provides them.
+		userID, err = firstInt64JSONValue("requester", wire.RequesterUin, wire.RequesterID, wire.UserID, wire.Uin, wire.InvitorUin)
+	}
+	if err != nil {
+		return grouprequest.SystemMessage{}, err
+	}
+	return grouprequest.SystemMessage{
+		RequestID: requestID,
+		GroupID:   groupID,
+		UserID:    userID,
+		Message:   wire.Message,
+		Checked:   wire.Checked,
+		RawJSON:   string(raw),
+	}, nil
+}
+
+func firstInt64JSONValue(field string, values ...json.RawMessage) (int64, error) {
+	// 调用方按优先级传入多个候选字段。某个候选格式不对不代表整条记录无效，
+	// 继续尝试后面的；全部失败时返回第一个错误，保留具体原因。
+	var firstErr error
+	for _, raw := range values {
+		value, err := decimalJSONValue(raw, field, false)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if value == "" || value == "0" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("decode %s %q: %w", field, value, err)
+			}
+			continue
+		}
+		if parsed == 0 {
+			continue
+		}
+		return parsed, nil
+	}
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return 0, fmt.Errorf("group system message %s is missing or zero", field)
+}
+
+func decimalJSONValue(raw json.RawMessage, field string, required bool) (string, error) {
+	value := strings.TrimSpace(string(raw))
+	if value == "" || value == "null" {
+		if required {
+			return "", fmt.Errorf("group system message %s is missing", field)
+		}
+		return "", nil
+	}
+	if value[0] == '"' {
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", fmt.Errorf("decode group system message %s: %w", field, err)
+		}
+		value = strings.TrimSpace(value)
+	}
+	if value == "" {
+		if required {
+			return "", fmt.Errorf("group system message %s is empty", field)
+		}
+		return "", nil
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return "", fmt.Errorf("group system message %s %q is not a decimal integer", field, value)
+		}
+	}
+	return value, nil
 }
 
 func extractAtUsers(chain message.Chain) []int64 {

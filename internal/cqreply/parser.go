@@ -5,17 +5,21 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
-	PartText       = "text"
-	PartImage      = "image"
-	localMediaRoot = "/app/jxh-media"
+	PartText         = "text"
+	PartImage        = "image"
+	PartFile         = "file"
+	PartRejectedFile = "rejected_file"
+	localMediaRoot   = "/app/jxh-media"
 )
 
 type Part struct {
 	Type  string
 	Value string
+	Name  string
 }
 
 type Result struct {
@@ -23,6 +27,8 @@ type Result struct {
 	PlainText          string
 	ImageCount         int
 	RejectedImageCount int
+	FileCount          int
+	RejectedFileCount  int
 }
 
 func Parse(answer string) Result {
@@ -59,48 +65,98 @@ func Parse(answer string) Result {
 		tag := remaining[:end+1]
 		remaining = remaining[end+1:]
 
-		imageURL, isImage := imageURLFromTag(tag)
-		if !isImage {
+		mediaType, source, name, isMedia := mediaFromTag(tag)
+		if !isMedia {
 			appendText(tag)
 			continue
 		}
-		if imageURL == "" {
-			result.RejectedImageCount++
+		if source == "" {
+			if mediaType == PartImage {
+				result.RejectedImageCount++
+			} else {
+				result.RejectedFileCount++
+				result.Parts = append(result.Parts, Part{Type: PartRejectedFile})
+			}
 			continue
 		}
-		result.Parts = append(result.Parts, Part{Type: PartImage, Value: imageURL})
-		result.ImageCount++
+		result.Parts = append(result.Parts, Part{Type: mediaType, Value: source, Name: name})
+		if mediaType == PartImage {
+			result.ImageCount++
+		} else {
+			result.FileCount++
+		}
 	}
 
 	result.PlainText = plain.String()
 	return result
 }
 
-func imageURLFromTag(tag string) (string, bool) {
+func mediaFromTag(tag string) (mediaType, source, name string, ok bool) {
 	body := strings.TrimSuffix(strings.TrimPrefix(tag, "[CQ:"), "]")
 	parts := strings.Split(body, ",")
-	if len(parts) == 0 || parts[0] != "image" {
-		return "", false
+	if len(parts) == 0 || (parts[0] != PartImage && parts[0] != PartFile) {
+		return "", "", "", false
 	}
+	mediaType = parts[0]
 
 	params := make(map[string]string, len(parts)-1)
 	for _, part := range parts[1:] {
-		key, value, ok := strings.Cut(part, "=")
-		if !ok {
+		key, value, found := strings.Cut(part, "=")
+		if !found {
 			continue
 		}
 		params[strings.TrimSpace(key)] = html.UnescapeString(strings.TrimSpace(value))
 	}
-	if isRemoteURL(params["url"]) {
-		return params["url"], true
+	for _, key := range []string{"url", "file"} {
+		if !isRemoteURL(params[key]) {
+			continue
+		}
+		if mediaType == PartFile {
+			name = remoteFileName(params[key])
+			if name == "" {
+				continue
+			}
+		}
+		return mediaType, params[key], name, true
 	}
-	if isRemoteURL(params["file"]) {
-		return params["file"], true
+
+	local := localMediaPath(params["file"])
+	if local == "" {
+		return mediaType, "", "", true
 	}
-	if local := localImageURI(params["file"]); local != "" {
-		return local, true
+	if mediaType == PartFile {
+		name = path.Base(local)
+		if !validFileName(name) {
+			return mediaType, "", "", true
+		}
+		return mediaType, local, name, true
 	}
-	return "", true
+	return mediaType, (&url.URL{Scheme: "file", Path: local}).String(), "", true
+}
+
+func remoteFileName(source string) string {
+	parsed, err := url.ParseRequestURI(source)
+	if err != nil {
+		return ""
+	}
+	name := path.Base(parsed.Path)
+	if !validFileName(name) {
+		return ""
+	}
+	return name
+}
+
+func validFileName(name string) bool {
+	if name == "" || name == "." || name == ".." || len(name) > 255 || !utf8.ValidString(name) ||
+		strings.TrimSpace(name) != name || strings.HasSuffix(name, ".") {
+		return false
+	}
+	for _, r := range name {
+		if r < ' ' || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return false
+		}
+	}
+	return true
 }
 
 func isRemoteURL(value string) bool {
@@ -113,7 +169,7 @@ func isRemoteURL(value string) bool {
 		parsed.Host != "" && parsed.User == nil
 }
 
-func localImageURI(value string) string {
+func localMediaPath(value string) string {
 	if value == "" || path.IsAbs(value) || strings.ContainsAny(value, `\:?#`) {
 		return ""
 	}
@@ -126,5 +182,5 @@ func localImageURI(value string) string {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return ""
 	}
-	return (&url.URL{Scheme: "file", Path: path.Join(localMediaRoot, cleaned)}).String()
+	return path.Join(localMediaRoot, cleaned)
 }

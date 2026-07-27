@@ -18,7 +18,7 @@ RUN apt-get update \
 COPY --from=build /out/jxh-bot /usr/local/bin/jxh-bot
 COPY config.example.yaml /app/config.yaml
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN mkdir -p /app/data/cache && chown -R appuser:appuser /app && chmod +x /usr/local/bin/entrypoint.sh
+RUN mkdir -p /app/data/cache /app/data/flash && chown -R appuser:appuser /app && chmod +x /usr/local/bin/entrypoint.sh
 
 ENV TZ=Asia/Shanghai
 EXPOSE 8080

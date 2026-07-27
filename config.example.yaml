@@ -54,7 +54,7 @@ database:
   trigger_log_retention_days: 180
 
 ai:
-  # 是否启用 /ai 入口。关闭或模型配置不完整时 /ai 会直接返回未启用。
+  # 是否启用 /ai 入口和待解析群申请的学号、姓名、专业提取。关闭或模型配置不完整时两项能力均禁用。
   enabled: true
   # ChatModel 提供方。支持 openai 和 ark；空值按 openai 处理。
   provider: "openai"
@@ -67,7 +67,7 @@ ai:
   api_key: ""
   # ChatModel 名称。openai 填模型名；ark 填方舟推理接入点 ID，如 ep-xxxxxxxx。
   model: ""
-  # 单次 ReAct Agent 问答的总超时时间，包含模型和知识搜索，单位秒。
+  # 单次 AI 请求的总超时时间，适用于 ReAct 问答和群申请字段提取，单位秒。
   timeout_sec: 30
   # /ai 问题最大长度，超过后会截断。
   max_question_chars: 500
