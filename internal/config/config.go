@@ -115,7 +115,7 @@ func Default() Config {
 			TimeoutSec:       30,
 			MaxQuestionChars: 500,
 		},
-		Quote:     QuoteConfig{BaseURL: "http://quote:5000", TimeoutSec: 10},
+		Quote:     QuoteConfig{BaseURL: "http://quote:5000", TimeoutSec: 30},
 		Scheduler: SchedulerConfig{Timezone: "Asia/Shanghai"},
 	}
 }
@@ -182,7 +182,7 @@ func normalize(cfg *Config) {
 		cfg.AI.Provider = "openai"
 	}
 	if cfg.Quote.TimeoutSec <= 0 {
-		cfg.Quote.TimeoutSec = 10
+		cfg.Quote.TimeoutSec = 30
 	}
 	if cfg.Scheduler.Timezone == "" {
 		cfg.Scheduler.Timezone = cfg.App.Timezone

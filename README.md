@@ -218,6 +218,7 @@ AI 行为：
 ```yaml
 quote:
   base_url: "http://quote:5000"
+  timeout_sec: 30
 ```
 
 ## 数据库

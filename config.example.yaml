@@ -76,7 +76,7 @@ quote:
   # 引用图服务地址。启用 quote profile 后默认映射到宿主机 5000。
   base_url: "http://127.0.0.1:5000"
   # 调用引用图服务超时时间，单位秒。
-  timeout_sec: 10
+  timeout_sec: 30
 
 scheduler:
   # 定时任务使用的时区。建议和 app.timezone 保持一致。

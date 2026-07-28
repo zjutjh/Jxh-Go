@@ -43,7 +43,7 @@ type Client struct {
 
 func NewClient(baseURL string, client *http.Client) *Client {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), client: client}
 }
