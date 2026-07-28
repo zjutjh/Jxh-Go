@@ -13,26 +13,46 @@ type MessageInput struct {
 	Nickname   string
 	RawMessage string
 	Message    message.Chain
+	Reply      *MessageInput
 }
 
 func BuildPayload(ctx context.Context, inputs []MessageInput, resolveImage func(context.Context, string) (string, error)) Payload {
 	payload := make(Payload, 0, len(inputs))
 	for _, input := range inputs {
-		chain := input.Message
-		if chain != nil {
-			chain = enrichMessageImages(ctx, chain, resolveImage)
-		}
-		content := contentFromMessage(input.RawMessage, chain)
-		if isEmptyContent(content) {
+		content := buildMessageContent(ctx, input, resolveImage)
+		reply := buildReply(ctx, input.Reply, resolveImage)
+		if isEmptyContent(content) && reply == nil {
 			continue
 		}
-		nickname := strings.TrimSpace(input.Nickname)
-		if nickname == "" {
-			nickname = "匿名"
-		}
-		payload = append(payload, Message{UserID: input.UserID, UserNickname: nickname, Message: content})
+		payload = append(payload, Message{UserID: input.UserID, UserNickname: quoteNickname(input.Nickname), Message: content, Reply: reply})
 	}
 	return payload
+}
+
+func buildReply(ctx context.Context, input *MessageInput, resolveImage func(context.Context, string) (string, error)) *ReplyMessage {
+	if input == nil {
+		return nil
+	}
+	return &ReplyMessage{
+		UserNickname: quoteNickname(input.Nickname),
+		Message:      buildMessageContent(ctx, *input, resolveImage),
+		Reply:        buildReply(ctx, input.Reply, resolveImage),
+	}
+}
+
+func buildMessageContent(ctx context.Context, input MessageInput, resolveImage func(context.Context, string) (string, error)) []MessageSegment {
+	chain := input.Message
+	if chain != nil {
+		chain = enrichMessageImages(ctx, chain, resolveImage)
+	}
+	return contentFromMessage(input.RawMessage, chain)
+}
+
+func quoteNickname(nickname string) string {
+	if nickname = strings.TrimSpace(nickname); nickname != "" {
+		return nickname
+	}
+	return "匿名"
 }
 
 func enrichMessageImages(ctx context.Context, chain message.Chain, resolveImage func(context.Context, string) (string, error)) message.Chain {
@@ -52,6 +72,9 @@ func enrichMessageImages(ctx context.Context, chain message.Chain, resolveImage 
 func enrichImageData(ctx context.Context, segment message.Segment, data map[string]any, resolveImage func(context.Context, string) (string, error)) map[string]any {
 	out := maps.Clone(data)
 	for _, source := range []string{segment.String("url"), segment.String("file")} {
+		if ctx.Err() != nil {
+			return out
+		}
 		if source == "" {
 			continue
 		}

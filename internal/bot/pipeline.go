@@ -22,7 +22,7 @@ type Sender interface {
 	SendGroupText(ctx context.Context, groupID int64, text string) error
 	SendGroupMessage(ctx context.Context, groupID int64, message message.Chain) error
 	SendGroupFlashFile(ctx context.Context, groupID int64, source, name string) error
-	GetQuoteMessages(ctx context.Context, groupID, messageID int64, count int) ([]QuotedMessage, error)
+	GetQuoteMessages(ctx context.Context, groupID int64, ref ReplyRef, count int) ([]QuotedMessage, error)
 	ResolveImage(ctx context.Context, file string) (string, error)
 	SetGroupBan(ctx context.Context, groupID, userID int64, duration time.Duration) error
 	SetRestart(ctx context.Context) error
@@ -33,10 +33,17 @@ const trackedLinkReplyPrefix = "精小弘觉得这个链接十分甚至九分不
 
 type QuotedMessage struct {
 	MessageID  int64
+	MessageSeq int64
 	UserID     int64
 	Nickname   string
 	RawMessage string
 	Message    message.Chain
+	Reply      *QuotedMessage
+}
+
+type ReplyRef struct {
+	ID  int64
+	Seq int64
 }
 
 type Options struct {
@@ -67,16 +74,16 @@ func (p *Pipeline) SetSender(sender Sender) {
 }
 
 type GroupMessage struct {
-	GroupID        int64
-	UserID         int64
-	SelfID         int64
-	Text           string
-	RawMessage     string
-	MessageID      int64
-	ReplyMessageID int64
-	IsSelf         bool
-	AtUsers        []int64
-	Segments       message.Chain
+	GroupID    int64
+	UserID     int64
+	SelfID     int64
+	Text       string
+	RawMessage string
+	MessageID  int64
+	Reply      ReplyRef
+	IsSelf     bool
+	AtUsers    []int64
+	Segments   message.Chain
 }
 
 func NewPipeline(opts Options) *Pipeline {

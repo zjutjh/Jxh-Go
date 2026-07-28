@@ -29,10 +29,7 @@ func sendKeywordReply(ctx context.Context, sender Sender, groupID int64, sourceK
 	if parsed.ImageCount == 0 && parsed.FileCount == 0 && parsed.RejectedFileCount == 0 {
 		fallback := parsed.PlainText
 		if strings.TrimSpace(fallback) == "" {
-			switch {
-			case parsed.RejectedFileCount > 0:
-				fallback = fileReplyUnavailableText
-			case parsed.RejectedImageCount > 0:
+			if parsed.RejectedImageCount > 0 {
 				fallback = imageReplyUnavailableText
 			}
 		}

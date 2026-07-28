@@ -25,6 +25,13 @@ type Message struct {
 	UserNickname string           `json:"user_nickname"`
 	Avatar       string           `json:"avatar,omitempty"`
 	Message      []MessageSegment `json:"message"`
+	Reply        *ReplyMessage    `json:"reply,omitempty"`
+}
+
+type ReplyMessage struct {
+	UserNickname string           `json:"user_nickname"`
+	Message      []MessageSegment `json:"message"`
+	Reply        *ReplyMessage    `json:"reply,omitempty"`
 }
 
 type Payload []Message

@@ -191,16 +191,16 @@ func (s Server) handleEvent(ctx context.Context, client *napcatsdk.Client, ev ev
 
 func toGroupMessage(e *event.GroupMessage) bot.GroupMessage {
 	return bot.GroupMessage{
-		GroupID:        e.GroupID,
-		UserID:         e.UserID,
-		SelfID:         e.SelfID(),
-		Text:           e.Message.Text(),
-		RawMessage:     e.RawMessage,
-		MessageID:      e.MessageID,
-		ReplyMessageID: extractReplyID(e.Message),
-		IsSelf:         e.UserID == e.SelfID(),
-		AtUsers:        extractAtUsers(e.Message),
-		Segments:       e.Message,
+		GroupID:    e.GroupID,
+		UserID:     e.UserID,
+		SelfID:     e.SelfID(),
+		Text:       e.Message.Text(),
+		RawMessage: e.RawMessage,
+		MessageID:  e.MessageID,
+		Reply:      extractReplyRef(e.Message),
+		IsSelf:     e.UserID == e.SelfID(),
+		AtUsers:    extractAtUsers(e.Message),
+		Segments:   e.Message,
 	}
 }
 
@@ -212,15 +212,16 @@ func markGroupMessageRead(ctx context.Context, client *napcatsdk.Client, e *even
 	return err
 }
 
-func extractReplyID(chain message.Chain) int64 {
-	for _, seg := range chain.OfType("reply") {
-		raw := seg.String("id")
-		id, err := strconv.ParseInt(raw, 10, 64)
-		if err == nil {
-			return id
+func extractReplyRef(chain message.Chain) bot.ReplyRef {
+	for _, segment := range chain {
+		if segment.Type != "reply" {
+			continue
 		}
+		id, _ := strconv.ParseInt(strings.TrimSpace(segment.String("id")), 10, 64)
+		seq, _ := strconv.ParseInt(strings.TrimSpace(segment.String("seq")), 10, 64)
+		return bot.ReplyRef{ID: id, Seq: seq}
 	}
-	return 0
+	return bot.ReplyRef{}
 }
 
 type SDKSender struct {
@@ -399,6 +400,8 @@ func (m *oneBotMessage) UnmarshalJSON(data []byte) error {
 
 type quoteMessage struct {
 	MessageID  oneBotInt64   `json:"message_id"`
+	MessageSeq oneBotInt64   `json:"message_seq"`
+	GroupID    oneBotInt64   `json:"group_id"`
 	UserID     oneBotInt64   `json:"user_id"`
 	RawMessage string        `json:"raw_message"`
 	Sender     quoteSender   `json:"sender"`
@@ -420,40 +423,238 @@ func (s SDKSender) GetGroupMemberRole(ctx context.Context, groupID, userID int64
 	return *resp.Role, nil
 }
 
-func (s SDKSender) GetQuoteMessages(ctx context.Context, groupID, messageID int64, count int) ([]bot.QuotedMessage, error) {
+const (
+	maxQuoteReplyDepth = 3
+	maxQuoteReplyNodes = 30
+)
+
+type quoteResolver struct {
+	sender  SDKSender
+	groupID int64
+	byID    map[int64]*bot.QuotedMessage
+	bySeq   map[int64]*bot.QuotedMessage
+	nodes   int
+}
+
+func (s SDKSender) GetQuoteMessages(ctx context.Context, groupID int64, ref bot.ReplyRef, count int) ([]bot.QuotedMessage, error) {
+	resolver := quoteResolver{
+		sender: s, groupID: groupID,
+		byID: make(map[int64]*bot.QuotedMessage), bySeq: make(map[int64]*bot.QuotedMessage),
+	}
+	messageSeq := ref.Seq
+	var history []quoteMessage
+	var err error
+	if messageSeq != 0 {
+		history, err = resolver.history(ctx, messageSeq, count)
+	}
+	if messageSeq == 0 || err != nil || quoteMessageIndex(history, messageSeq) < 0 {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if ref.ID == 0 {
+			if err != nil {
+				return nil, fmt.Errorf("按回复序号获取群历史失败: %w", err)
+			}
+			return nil, fmt.Errorf("NapCat 返回的群历史中未找到回复序号 %d", messageSeq)
+		}
+		target, idErr := resolver.messageByID(ctx, ref.ID)
+		if idErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("按回复消息 ID 获取消息失败: %w", idErr))
+		}
+		messageSeq = target.MessageSeq
+		if messageSeq == 0 {
+			return nil, fmt.Errorf("NapCat 消息 %d 缺少 message_seq", ref.ID)
+		}
+		history, err = resolver.history(ctx, messageSeq, count)
+		if err != nil {
+			return nil, fmt.Errorf("按回复消息序号获取群历史失败: %w", err)
+		}
+	}
+	targetIndex := quoteMessageIndex(history, messageSeq)
+	if targetIndex < 0 {
+		return nil, fmt.Errorf("NapCat 返回的群历史中未找到回复序号 %d", messageSeq)
+	}
+	start := max(0, targetIndex-count+1)
+	messages := make([]bot.QuotedMessage, 0, targetIndex-start+1)
+	for _, wire := range history[start : targetIndex+1] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		base := resolver.remember(wire)
+		quoted := *base
+		quoted.Reply = nil
+		resolver.expand(ctx, &quoted, base, 1, map[*bot.QuotedMessage]struct{}{base: {}})
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		messages = append(messages, quoted)
+	}
+	s.enrichQuoteAtNames(ctx, groupID, messages)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return messages, nil
+}
+
+func quoteMessageIndex(messages []quoteMessage, seq int64) int {
+	return slices.IndexFunc(messages, func(message quoteMessage) bool {
+		return int64(message.MessageSeq) == seq
+	})
+}
+
+func (r *quoteResolver) history(ctx context.Context, seq int64, count int) ([]quoteMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if seq == 0 {
+		return nil, fmt.Errorf("message_seq is required")
+	}
 	var history struct {
 		Messages []quoteMessage `json:"messages"`
 	}
-	messageSeq := strconv.FormatInt(messageID, 10)
-	err := s.client.API().Call(ctx, string(api.ActionGetGroupMsgHistory), api.GetGroupMsgHistoryRequest{
-		GroupID:      strconv.FormatInt(groupID, 10),
+	messageSeq := strconv.FormatInt(seq, 10)
+	err := r.sender.client.API().Call(ctx, string(api.ActionGetGroupMsgHistory), api.GetGroupMsgHistoryRequest{
+		GroupID:      strconv.FormatInt(r.groupID, 10),
 		MessageSeq:   &messageSeq,
 		Count:        float64(count),
 		ReverseOrder: true,
 	}, &history)
 	if err != nil {
-		return nil, fmt.Errorf("按引用消息获取群历史失败: %w", err)
+		return nil, err
 	}
-	targetIndex := slices.IndexFunc(history.Messages, func(message quoteMessage) bool {
-		return int64(message.MessageID) == messageID
-	})
-	if targetIndex < 0 {
-		return nil, fmt.Errorf("NapCat 返回的群历史中未找到被引用消息 %d", messageID)
+	for _, message := range history.Messages {
+		r.remember(message)
 	}
-	start := max(0, targetIndex-count+1)
-	messages := make([]bot.QuotedMessage, 0, targetIndex-start+1)
-	for _, message := range history.Messages[start : targetIndex+1] {
-		messages = append(messages, message.quoted())
+	return history.Messages, nil
+}
+
+func (r *quoteResolver) remember(message quoteMessage) *bot.QuotedMessage {
+	id, seq := int64(message.MessageID), int64(message.MessageSeq)
+	cached := r.bySeq[seq]
+	if cached == nil {
+		cached = r.byID[id]
 	}
-	s.enrichQuoteAtNames(ctx, groupID, messages)
-	return messages, nil
+	quoted := message.quoted()
+	if cached == nil {
+		cached = &quoted
+	} else {
+		*cached = quoted
+	}
+	if id != 0 {
+		r.byID[id] = cached
+	}
+	if seq != 0 {
+		r.bySeq[seq] = cached
+	}
+	return cached
+}
+
+func (r *quoteResolver) resolve(ctx context.Context, ref bot.ReplyRef) (*bot.QuotedMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var seqErr error
+	if ref.Seq != 0 {
+		if cached := r.bySeq[ref.Seq]; cached != nil {
+			return cached, nil
+		}
+		history, err := r.history(ctx, ref.Seq, 1)
+		if err == nil {
+			if index := quoteMessageIndex(history, ref.Seq); index >= 0 {
+				return r.remember(history[index]), nil
+			}
+			err = fmt.Errorf("NapCat 返回的群历史中未找到回复序号 %d", ref.Seq)
+		}
+		seqErr = fmt.Errorf("按回复序号获取消息失败: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ref.ID != 0 {
+		message, err := r.messageByID(ctx, ref.ID)
+		if err == nil {
+			return message, nil
+		}
+		return nil, errors.Join(seqErr, fmt.Errorf("按回复消息 ID 获取消息失败: %w", err))
+	}
+	if seqErr != nil {
+		return nil, seqErr
+	}
+	return nil, fmt.Errorf("回复引用缺少 id 和 seq")
+}
+
+func (r *quoteResolver) messageByID(ctx context.Context, id int64) (*bot.QuotedMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if cached := r.byID[id]; cached != nil {
+		return cached, nil
+	}
+	var message quoteMessage
+	err := r.sender.client.API().Call(ctx, string(api.ActionGetMsg), api.GetMsgRequest{
+		MessageID: api.GetMsgRequestMessageIDUnion{Raw: []byte(strconv.FormatInt(id, 10))},
+	}, &message)
+	if err != nil {
+		return nil, err
+	}
+	if int64(message.MessageID) != id {
+		return nil, fmt.Errorf("NapCat get_msg 返回了不匹配的 message_id %d", message.MessageID)
+	}
+	if message.GroupID != 0 && int64(message.GroupID) != r.groupID {
+		return nil, fmt.Errorf("NapCat get_msg 返回了其他群的消息")
+	}
+	return r.remember(message), nil
+}
+
+func (r *quoteResolver) expand(ctx context.Context, target, base *bot.QuotedMessage, depth int, visiting map[*bot.QuotedMessage]struct{}) {
+	if ctx.Err() != nil {
+		return
+	}
+	ref := extractReplyRef(base.Message)
+	if ref == (bot.ReplyRef{}) {
+		return
+	}
+	if depth > maxQuoteReplyDepth || r.nodes >= maxQuoteReplyNodes {
+		target.Reply = quoteFallback("[更早的回复已省略]")
+		return
+	}
+	r.nodes++
+	next, err := r.resolve(ctx, ref)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("get replied quote message failed: group=%d reply_id=%d reply_seq=%d: %v", r.groupID, ref.ID, ref.Seq, err)
+			target.Reply = quoteFallback("[引用消息不可用]")
+		}
+		return
+	}
+	if _, cycle := visiting[next]; cycle {
+		target.Reply = quoteFallback("[循环回复已省略]")
+		return
+	}
+	reply := *next
+	reply.Reply = nil
+	target.Reply = &reply
+	visiting[next] = struct{}{}
+	r.expand(ctx, &reply, next, depth+1, visiting)
+	delete(visiting, next)
+}
+
+func quoteFallback(text string) *bot.QuotedMessage {
+	return &bot.QuotedMessage{Nickname: "匿名", RawMessage: text}
 }
 
 func (s SDKSender) enrichQuoteAtNames(ctx context.Context, groupID int64, messages []bot.QuotedMessage) {
 	names := map[string]string{"all": "全体成员"}
-	for messageIndex := range messages {
-		chain := message.ChainOf(messages[messageIndex].Message...)
+	var enrich func(*bot.QuotedMessage)
+	enrich = func(quoted *bot.QuotedMessage) {
+		if quoted == nil || ctx.Err() != nil {
+			return
+		}
+		chain := message.ChainOf(quoted.Message...)
 		for segmentIndex, segment := range chain {
+			if ctx.Err() != nil {
+				return
+			}
 			if segment.Type != "at" || strings.TrimSpace(segment.String("name")) != "" ||
 				strings.TrimSpace(segment.String("card")) != "" || strings.TrimSpace(segment.String("nickname")) != "" {
 				continue
@@ -490,7 +691,11 @@ func (s SDKSender) enrichQuoteAtNames(ctx context.Context, groupID int64, messag
 			data["name"] = name
 			chain[segmentIndex].Data = data
 		}
-		messages[messageIndex].Message = chain
+		quoted.Message = chain
+		enrich(quoted.Reply)
+	}
+	for i := range messages {
+		enrich(&messages[i])
 	}
 }
 
@@ -500,7 +705,7 @@ func (m quoteMessage) quoted() bot.QuotedMessage {
 		userID = int64(m.Sender.UserID)
 	}
 	return bot.QuotedMessage{
-		MessageID: int64(m.MessageID), UserID: userID,
+		MessageID: int64(m.MessageID), MessageSeq: int64(m.MessageSeq), UserID: userID,
 		Nickname: senderNickname(m.Sender), RawMessage: m.RawMessage, Message: m.Message.Chain,
 	}
 }

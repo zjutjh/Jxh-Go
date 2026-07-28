@@ -119,20 +119,17 @@ func (r *GroupCommandRouter) handleQuote(ctx context.Context, msg GroupMessage, 
 	if err != nil {
 		return sender.SendGroupText(ctx, msg.GroupID, "用法：回复一条消息后发送 /q [1-10]")
 	}
-	if msg.ReplyMessageID == 0 {
+	if msg.Reply == (ReplyRef{}) {
 		return sender.SendGroupText(ctx, msg.GroupID, "请回复一条消息后使用 /q")
 	}
-	quoted, err := sender.GetQuoteMessages(ctx, msg.GroupID, msg.ReplyMessageID, count)
+	quoted, err := sender.GetQuoteMessages(ctx, msg.GroupID, msg.Reply, count)
 	if err != nil {
-		log.Printf("get quote messages failed: group=%d message=%d: %v", msg.GroupID, msg.ReplyMessageID, err)
+		log.Printf("get quote messages failed: group=%d reply_id=%d reply_seq=%d: %v", msg.GroupID, msg.Reply.ID, msg.Reply.Seq, err)
 		return sender.SendGroupText(ctx, msg.GroupID, "获取被引用消息失败，请稍后再试")
 	}
 	inputs := make([]quote.MessageInput, 0, len(quoted))
 	for _, message := range quoted {
-		inputs = append(inputs, quote.MessageInput{
-			UserID: message.UserID, Nickname: message.Nickname,
-			RawMessage: message.RawMessage, Message: message.Message,
-		})
+		inputs = append(inputs, quoteInputFromMessage(&message))
 	}
 	payload := quote.BuildPayload(ctx, inputs, sender.ResolveImage)
 	if len(payload) == 0 {
@@ -145,6 +142,18 @@ func (r *GroupCommandRouter) handleQuote(ctx context.Context, msg GroupMessage, 
 		return sender.SendGroupText(ctx, msg.GroupID, "引用图生成失败，请稍后再试")
 	}
 	return sender.SendGroupMessage(ctx, msg.GroupID, message.ChainOf(message.Image("base64://"+image)))
+}
+
+func quoteInputFromMessage(message *QuotedMessage) quote.MessageInput {
+	input := quote.MessageInput{
+		UserID: message.UserID, Nickname: message.Nickname,
+		RawMessage: message.RawMessage, Message: message.Message,
+	}
+	if message.Reply != nil {
+		reply := quoteInputFromMessage(message.Reply)
+		input.Reply = &reply
+	}
+	return input
 }
 
 func parseQuoteCount(text string) (int, error) {
